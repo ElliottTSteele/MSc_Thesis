@@ -1,0 +1,33 @@
+__pycache__/
+.ipynb_checkpoints/
+data/
+results/
+figures/
+
+# VS Code local settings
+.vscode/
+
+# Logs / temporary outputs
+*.log
+*_log.csv
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Large data files
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.mat
+*.nc
+
+# Videos / animations
+*.mp4
+*.gif
+*.avi
+*.mov

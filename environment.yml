@@ -1,0 +1,19 @@
+name: msc_thesis
+channels:
+  - conda-forge
+dependencies:
+  - h5py
+  - ffmpeg
+  - ipykernel
+  - jupyterlab
+  - matplotlib
+  - numpy
+  - pandas
+  - python=3.11
+  - scipy
+  - tqdm
+  - pip
+  - pip:
+    - pydmd
+    - chaosmagpy
+prefix: "/home/elliott/miniforge3/envs/msc_thesis"
