@@ -1,0 +1,5 @@
+This folder contains all investigations on the resolution matrix
+data provided by DTU space for CHAOS-8.6. It focuses entirely on
+'intrinsic' properties of the resolution matrix, i.e. how does
+it structure inform its expected effect on data, followed by a 
+test on simple single coefficient sinusoidal signals.

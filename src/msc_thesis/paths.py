@@ -15,3 +15,7 @@ FIG_DIR = PROJECT_ROOT/"figures"
 FELIX_DIR = DATA_DIR / "modes_surface"
 CHAOS_DIR = DATA_DIR / "chaos_mats"
 CHAOS_RESOL_DIR = DATA_DIR / "chaos_resolution_matrices"
+CHAOS_COV_DIR = DATA_DIR/ "chaos_covariance"
+
+# Defining optimal width for figures to fit on A4 paper
+text_width = 7.25

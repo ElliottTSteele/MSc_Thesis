@@ -149,8 +149,8 @@ dt_years = 0.2
 
 notable_times_raw = {
     "CHAMP Start (2000/08)": 2000 + 8/12,
-    "CHAMP Start (2010/09)": 2010 + 9/12,
-    "SWARM End (2013/11)": 2013 + 11/12,
+    "CHAMP End (2010/09)": 2010 + 9/12,
+    "SWARM Start (2013/11)": 2013 + 11/12,
     "(2026/01)": 2025
 }
 
@@ -215,7 +215,7 @@ high_quality_idx, poor_quality_idx = split_spline_quality_indices(
     include_end=False
 )
 # %%
-fig, ax = plt.subplots(1, 2, figsize=(12, 5), constrained_layout=True)
+fig, ax = plt.subplots(1, 2, figsize=(text_width, 3.5), constrained_layout=True)
 
 # -------------------------
 # 1) T_kl in spline space
@@ -238,27 +238,27 @@ for event, t_rel in notable_times_aspline.items():
         transform=ax[0].get_yaxis_transform(),
         ha="left",
         va="bottom",
-        fontsize=12,
+        fontsize=10,
         color='white',
         bbox=dict(
             facecolor="black",
-            alpha=0.65,
+            alpha=0.3,
             edgecolor="none",
             boxstyle="round,pad=0.2"
         )
     )
 
 ax[0].set_box_aspect(1)
-ax[0].set_xlabel(r"input spline index $\ell$")
-ax[0].set_ylabel(r"output spline index $k$")
-ax[0].set_title(r"Spline-space $T_{k\ell}$")
+ax[0].set_xlabel(r"input spline index $p$")
+ax[0].set_ylabel(r"output spline index $\ell$")
+ax[0].set_title(r"Spline-space $T_{\ell p}$")
 
-fig.colorbar(
+'''fig.colorbar(
     pcm0,
     ax=ax[0],
     label=r"$T_{k\ell}$"
 )
-
+'''
 
 # -----------------------------------
 # 2) H_mf @ T_kl / 440 @ P in gnm space
@@ -283,29 +283,35 @@ for event, t_rel in notable_times_relative.items():
         transform=ax[1].get_yaxis_transform(),
         ha="left",
         va="bottom",
-        fontsize=12,
+        fontsize=10,
         color='white',
         bbox=dict(
             facecolor="black",
-            alpha=0.65,
+            alpha=0.3,
             edgecolor="none",
             boxstyle="round,pad=0.2"
         )
     )
 
 ax[1].set_box_aspect(1)
-ax[1].set_xlabel(r"input time index $\ell$")
-ax[1].set_ylabel(r"output time index $k$")
-ax[1].set_title(r"Time-domain $H_{\mathrm{mf}} (T_{k\ell}) P$")
+ax[1].set_xlabel(r"input time index $p$")
+ax[1].set_ylabel(r"output time index $\ell$")
+ax[1].set_title(r"Time-domain $H_{\mathrm{MF}} (T_{\ell p}) P$")
 
-ax[1].legend(loc="upper left")
 
-fig.colorbar(
+'''fig.colorbar(
     pcm1,
     ax=ax[1],
     label="$H_{\mathrm{mf}} (T_{k\ell}) P$"
+)'''
+fig.colorbar(
+    pcm0,
+    ax=ax[1],
+    label=r"$T_{k\ell}$"
 )
 
+
+plt.savefig(f"{FIG_DIR}/final/total_Tkl_plot.png", dpi=300, bbox_inches="tight")
 plt.show()
 
 
@@ -472,14 +478,14 @@ titles = ["n = 1", "n = 10", "n = 20"]
 vmin = 0
 vmax = 1
 
-fig, axes = plt.subplots(1, len(Tkl_list), figsize=(14, 4), constrained_layout=True)
+fig, axes = plt.subplots(1, len(Tkl_list), figsize=(text_width, text_width/3), constrained_layout=True)
 axes = axes.ravel()
 
 for ax, Tkl, title in zip(axes, Tkl_list_t, titles):
     pcm = ax.pcolormesh(Tkl, shading="auto", vmin=vmin, vmax=vmax)
     ax.set_title(title)
-    ax.set_xlabel(r"input spline index $\ell$")
-    ax.set_ylabel(r"output spline index $k$")
+    ax.set_xlabel(r"input spline index $p$")
+    ax.set_ylabel(r"output spline index $\ell$")
     ax.set_box_aspect(1)
     for event, t_rel in notable_times_aspline.items():
 
@@ -493,6 +499,47 @@ fig.colorbar(
     ax=axes,
     label=r"$T_{k\ell}^{j=n}$",
 )
+plt.savefig(f"{FIG_DIR}/final/by_n_Tkl_plot.png", dpi=300, bbox_inches="tight")
+
+plt.show()
+
+# %%
+# but what about P @ H_MF? i.e. what do splines look like
+centre_idx = int(45)
+
+MF_line = np.abs((H_MF @ Tkl_n20 @ P)[centre_idx, :])
+SV_line = np.abs((H_SV @ Tkl_n20 @ P)[centre_idx, :])
+SA_line = np.abs((H_SA @ Tkl_n20 @ P)[centre_idx, :])
+
+n_input = MF_line.size
+
+# Relative input time-step axis:
+# centre_idx is labelled 0,
+# indices after it are +1, +2, ...
+# indices before it are -1, -2, ...
+x_rel = np.arange(n_input) - centre_idx
+
+fig, ax = plt.subplots(figsize=(5, 5))
+
+ax.plot(x_rel, MF_line/np.max(MF_line), label="MF")
+ax.plot(x_rel, SV_line/np.max(SV_line), label="SV")
+ax.plot(x_rel, SA_line/np.max(SA_line), label="SA")
+
+ax.axvline(
+    0,
+    color="black",
+    linestyle="--",
+    linewidth=1,
+    label=r"input time step $k_j$"
+)
+
+ax.set_xlabel(r"input time step relative to $k_j$")
+ax.set_ylabel(r"relative contribution to output time step $k_j^r$")
+ax.set_title(r"Time-domain contribution kernels centred on output time step $k_j^r$")
+ax.set_xlim((-35, 35))
+ax.grid(True, alpha=0.3)
+ax.legend()
+plt.savefig(f"{FIG_DIR}/derivative_wavelets_post_T.png", dpi=300, bbox_inches="tight")
 
 plt.show()
 
@@ -532,6 +579,7 @@ ax.set_title(r"Time-domain contribution kernels centred on output time step $k_j
 ax.set_xlim((-35, 35))
 ax.grid(True, alpha=0.3)
 ax.legend()
+plt.savefig(f"{FIG_DIR}/derivative_wavelets.png", dpi=300, bbox_inches="tight")
 
 plt.show()
 # %% visualising R from the perspective of R_ij block norms
@@ -668,12 +716,14 @@ Rij_norm = make_Rij_block_norm_matrix(
 )
 
 # %%
-fig, ax = plt.subplots(figsize=(7, 6), constrained_layout=True)
+fig, ax = plt.subplots(figsize=(6, 5), constrained_layout=True)
 
 pcm = ax.imshow(
     Rij_norm/np.max(Rij_norm),
     origin="lower",
-    aspect="equal"
+    aspect="equal",
+    vmin=0,
+    vmax=0.2
 )
 
 for idx in degrees_idx:
@@ -688,32 +738,8 @@ ax.set_title(r"Full $R_{ij}$ block norm matrix")
 
 cbar = fig.colorbar(pcm, ax=ax)
 cbar.set_label(r"block norm $\|R_{ij}\|$")
+plt.savefig(f"{FIG_DIR}/R_ij_total_scale_enhanced.png", dpi=300, bbox_inches="tight")
 
-plt.show()
-
-# %%
-
-col_sums = Rij_norm.sum(axis=0, keepdims=True)
-col_maxes = Rij_norm.max(axis=0, keepdims=True)
-
-Rij_norm_col = np.divide(
-    Rij_norm,
-    col_maxes,
-    out=np.zeros_like(Rij_norm),
-    where=col_sums != 0,
-)
-fig, ax = plt.subplots(figsize=(7, 7))
-
-pcm = ax.pcolormesh((Rij_norm), shading="auto", vmin=0, vmax=1, cmap='binary')
-
-ax.set_aspect("equal", adjustable='box')
-ax.invert_yaxis()
-
-ax.set_xlabel("input Gauss coefficient index $j$")
-ax.set_ylabel("output Gauss coefficient index $i$")
-ax.set_title("Column-normalised block norm matrix")
-
-fig.colorbar(pcm, ax=ax, label="fraction of input leakage")
 plt.show()
 
 # %%
@@ -889,12 +915,161 @@ spline_windowed_poor = make_Rij_block_norm_matrix_spline_windowed(
 )
 # %% normalise relative to R00 best recovery norm
 spline_windowed_good_0max =\
-      spline_windowed_good / np.max(spline_windowed_good)
+      (spline_windowed_good / np.sum(spline_windowed_good[:,0]))
 spline_windowed_poor_0max =\
-      spline_windowed_poor / np.max(spline_windowed_good)
+      (spline_windowed_poor / np.sum(spline_windowed_poor[:,0]))
+
+# %%
+# %%
 
 
+spline_windowed_diff = (
+    spline_windowed_poor_0max
+    - spline_windowed_good_0max
+)
 
+quality_vmin = 0.0
+quality_vmax = 0.2
+
+# Symmetric scale for the difference figure
+diff_abs_max = np.max(np.abs(spline_windowed_diff))
+
+
+def add_degree_boundaries(axis, matrix_shape):
+    for idx in degrees_idx:
+        if idx < matrix_shape[1]:
+            axis.axvline(
+                idx,
+                color="white",
+                linestyle="--",
+                linewidth=0.3,
+                alpha=0.9,
+            )
+
+        if idx < matrix_shape[0]:
+            axis.axhline(
+                idx,
+                color="white",
+                linestyle="--",
+                linewidth=0.3,
+                alpha=0.9,
+            )
+
+
+with plt.rc_context({
+    "font.size": 10,
+    "axes.titlesize": 10,
+    "axes.labelsize": 10,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+    "legend.fontsize": 10,
+    "figure.titlesize": 10,
+}):
+
+    # =========================================================
+    # FIGURE 1: HIGH- AND POOR-QUALITY WINDOWS
+    # =========================================================
+
+    fig, ax = plt.subplots(
+        1,
+        2,
+        figsize=(0.8*text_width, 0.8*0.48 * text_width),
+        constrained_layout=True,
+        sharex=True,
+        sharey=True,
+    )
+
+    pcm_good = ax[0].pcolormesh(
+        spline_windowed_good_0max,
+        shading="auto",
+        vmin=quality_vmin,
+        vmax=quality_vmax,
+    )
+
+    ax[0].set_title("High-quality spline window")
+    ax[0].set_xlabel(r"Input Gauss coefficient index $j$")
+    ax[0].set_ylabel(r"Output Gauss coefficient index $i$")
+    ax[0].set_box_aspect(1)
+
+    pcm_poor = ax[1].pcolormesh(
+        spline_windowed_poor_0max,
+        shading="auto",
+        vmin=quality_vmin,
+        vmax=quality_vmax,
+    )
+
+    ax[1].set_title("Low-quality spline window")
+    ax[1].set_xlabel(r"Input Gauss coefficient index $j$")
+    ax[1].set_box_aspect(1)
+
+    for axis, matrix in zip(
+        ax,
+        [spline_windowed_good_0max, spline_windowed_poor_0max],
+    ):
+        add_degree_boundaries(axis, matrix.shape)
+
+    # One shared colour bar, placed to the right
+    cbar = fig.colorbar(
+        pcm_poor,
+        ax=ax,
+        location="right",
+        pad=0.02,
+        shrink=0.90,
+    )
+    cbar.set_label("Normalised windowed block norm")
+
+    fig.savefig(
+        f"{FIG_DIR}/final/R_ij_block_norm_good_poor.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+
+    plt.show()
+
+
+    # =========================================================
+    # FIGURE 2: POOR MINUS HIGH QUALITY
+    # =========================================================
+
+    fig, ax = plt.subplots(
+        figsize=(0.5 * text_width, 0.4 * text_width),
+        constrained_layout=True,
+    )
+
+    pcm_diff = ax.pcolormesh(
+        spline_windowed_diff,
+        shading="auto",
+        vmin=-0.2,
+        vmax=0.2,
+        cmap="RdBu_r",
+    )
+
+    ax.set_title("Poor minus high quality")
+    ax.set_xlabel(r"Input Gauss coefficient index $j$")
+    ax.set_ylabel(r"Output Gauss coefficient index $i$")
+    ax.set_box_aspect(1)
+
+    add_degree_boundaries(
+        ax,
+        spline_windowed_diff.shape,
+    )
+
+    cbar = fig.colorbar(
+        pcm_diff,
+        ax=ax,
+        location="right",
+        pad=0.03,
+        shrink=0.90,
+    )
+    cbar.set_label("Difference in normalised block norm")
+
+    fig.savefig(
+        f"{FIG_DIR}/final/R_ij_block_norm_poor_minus_good.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+
+    plt.show()
 # %%
 
 # If your normalise_columns function does NOT take a second argument,
@@ -920,7 +1095,7 @@ pcm0 = ax[0].pcolormesh(
     spline_windowed_good_0max,
     shading="auto",
     vmin=0,
-    vmax=1
+    vmax=0.2
 )
 
 ax[0].set_title("High-quality spline window")
@@ -935,7 +1110,7 @@ pcm1 = ax[1].pcolormesh(
     spline_windowed_poor_0max,
     shading="auto",
     vmin=0,
-    vmax=1
+    vmax=0.2
 )
 
 ax[1].set_title("Poor-quality spline window")
@@ -954,7 +1129,7 @@ pcm2 = ax[2].pcolormesh(
     cmap="RdBu_r"
 )
 
-ax[2].set_title("Poor - high quality")
+ax[2].set_title("Low - high quality")
 ax[2].set_xlabel("input Gauss coefficient index $j$")
 ax[2].set_ylabel("output Gauss coefficient index $i$")
 ax[2].set_box_aspect(1)
@@ -965,9 +1140,9 @@ ax[2].set_box_aspect(1)
 for a in ax:
     for idx in degrees_idx:
         # only draw boundaries that lie inside the plotted matrix extent
-        if idx < spline_windowed_norm_g.shape[1]:
+        if idx < spline_windowed_diff.shape[1]:
             a.axvline(idx, color="white", linestyle="--", linewidth=0.8, alpha=0.9)
-        if idx < spline_windowed_norm_g.shape[0]:
+        if idx < spline_windowed_diff.shape[0]:
             a.axhline(idx, color="white", linestyle="--", linewidth=0.8, alpha=0.9)
 
 # -------------------
@@ -976,6 +1151,7 @@ for a in ax:
 fig.colorbar(pcm0, ax=ax[0], label="normalised windowed block norm")
 fig.colorbar(pcm1, ax=ax[1], label="normalised windowed block norm")
 fig.colorbar(pcm2, ax=ax[2], label="difference in normalised block norm")
+plt.savefig(f"{FIG_DIR}/R_ij_block_norm_goodvbad.png", dpi=300, bbox_inches="tight")
 
 plt.show()
 
@@ -987,8 +1163,8 @@ plt.show()
 # (edit these to whichever two you want to compare)
 # -------------------------------------------------
 coeff_idx_1 = 0
-coeff_idx_2 = 220
-coeff_idx_3 = 439
+coeff_idx_2 = n_Gauss_Coeffs(20)-1
+coeff_idx_3 = np.arange(n_Gauss_Coeffs(7), n_Gauss_Coeffs(8))
 
 # If you want the second one to be 200 instead, use:
 # coeff_idx_2 = 200
@@ -1006,33 +1182,87 @@ degrees_idx = n_Gauss_Coeffs(degrees)
 # -------------------------------------------------
 # Helper plotting function
 # -------------------------------------------------
+# -------------------------------------------------
+# Helper plotting function
+# -------------------------------------------------
 def plot_leakage_panel(ax, M, col_idx, title, degrees_idx):
     """
-    Plots the leakage of injected input coefficient j=col_idx
-    into all output coefficients i, i.e. M[:, col_idx].
+    Plot the summed leakage from either one input coefficient or a
+    continuous range of input coefficients.
+
+    Examples
+    --------
+    col_idx = 300
+        Uses M[:, 300].
+
+    col_idx = [300, 400]
+        Uses and sums M[:, 300:401].
     """
-    y = M[:, col_idx]
+
+    passed_indices = np.atleast_1d(col_idx).astype(int)
+
+    if len(passed_indices) == 1:
+        start_idx = end_idx = passed_indices[0]
+        col_indices = passed_indices
+        line_label = fr"input coefficient $j={start_idx}$"
+    else:
+        start_idx = np.min(passed_indices)
+        end_idx = np.max(passed_indices)
+
+        # Include every coefficient from start_idx to end_idx
+        col_indices = np.arange(start_idx, end_idx + 1)
+
+        line_label = (
+            fr"input coefficients $j={start_idx},\ldots,{end_idx}$"
+        )
+
+    # Sum the contributions from all selected input coefficients
+    y = np.sum(M[:, col_indices], axis=1)
     x = np.arange(len(y))
 
-    ax.plot(x, y, linewidth=1.8, marker='x',\
-             label=fr"input coeff $j={col_idx}$")
-
-    # black dashed line at injected coefficient index
-    ax.axvline(
-        col_idx,
+    # Join all points with a neutral line
+    ax.plot(
+        x,
+        y,
         color="black",
-        linestyle="--",
         linewidth=1.2,
-        label="injected coefficient"
+        alpha=0.7
     )
 
-    # red dashed lines at spherical harmonic degree boundaries
+    # Identify output coefficients lying inside the input range
+    input_mask = (x >= start_idx) & (x <= end_idx)
+
+    # Points corresponding to the injected/input coefficient range
+    ax.scatter(
+        x[input_mask],
+        y[input_mask],
+        color="green",
+        marker="o",
+        s=5,
+        linewidths=1.8,
+        label=line_label,
+        zorder=3
+    )
+
+    # Leakage outside the injected/input coefficient range
+    ax.scatter(
+        x[~input_mask],
+        y[~input_mask],
+        color="red",
+        marker="o",
+        s=1,
+        linewidths=1.8,
+        label="leakage outside input range",
+        zorder=3
+    )
+
+    # Spherical harmonic degree boundaries
     first_deg_line = True
     for idx in degrees_idx:
         if idx < len(y):
             ax.axvline(
                 idx,
-                color="red",
+                color="blue",
                 linestyle="--",
                 linewidth=1.0,
                 alpha=0.8,
@@ -1041,22 +1271,16 @@ def plot_leakage_panel(ax, M, col_idx, title, degrees_idx):
             first_deg_line = False
 
     ax.set_title(title)
-    ax.set_xlabel("output Gauss coefficient index $i$")
-    ax.set_ylabel(r"leakage amplitude / normalised block norm")
+    ax.set_xlabel(r"output Gauss coefficient index $i$")
+    ax.set_ylabel(r"summed $||R_{ij}|| \approx$ leakage")
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=9)
 
 cols_to_plot = [coeff_idx_1, coeff_idx_2, coeff_idx_3]
 
-y_global_max = max(
-    np.max(spline_windowed_poor_0max[:, cols_to_plot]),
-    np.max(spline_windowed_good_0max[:, cols_to_plot])
-)
+y_global_max = 1
 
-y_global_min = min(
-    np.min(spline_windowed_poor_0max[:, cols_to_plot]),
-    np.min(spline_windowed_good_0max[:, cols_to_plot])
-)
+y_global_min = 0
 # -------------------------------------------------
 # 2x2 figure
 # top row    = poor
@@ -1064,7 +1288,7 @@ y_global_min = min(
 # col 1      = first chosen coefficient
 # col 2      = second chosen coefficient
 # -------------------------------------------------
-fig, ax = plt.subplots(2, 3, figsize=(12, 9), constrained_layout=True, sharex=True)
+fig, ax = plt.subplots(2, 3, figsize=(16, 8), constrained_layout=True, sharex=True)
 
 # Top row: poor
 plot_leakage_panel(
@@ -1087,7 +1311,7 @@ plot_leakage_panel(
     ax[0, 2],
     spline_windowed_poor_0max,
     coeff_idx_3,
-    title=fr"Poor record: injected coefficient $j={coeff_idx_2}$",
+    title=fr"Poor record: injection over degree n = 7",
     degrees_idx=degrees_idx
 )
 
@@ -1112,12 +1336,13 @@ plot_leakage_panel(
     ax[1, 2],
     spline_windowed_good_0max,
     coeff_idx_3,
-    title=fr"Good record: injected coefficient $j={coeff_idx_2}$",
+    title=fr"Good record: injection over degree n = 7",
     degrees_idx=degrees_idx
 )
 for a in ax.ravel():
     a.set_ylim(y_global_min, y_global_max)
 fig.suptitle("Leakage of injected Gauss coefficients into output coefficients", fontsize=14)
+plt.savefig(f"{FIG_DIR}/leakage_examles_Rij.png", dpi=300, bbox_inches="tight")
 
 plt.show()
 # %% need code that can retrieve the real order of a gauss_i

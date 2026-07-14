@@ -259,26 +259,7 @@ def Sparse_R_Apply_One(gnm_spl, s, which="MF"):
     )
     return gnm_filt_spl
 
-# naive applying R whole at once
-''''def R_apply(gnm_spl):
-
-    gnm_spl_vec = gnm_spl.ravel(order="F")
-
-    R = R_Read_In(R_part="R")
-    gnm_filt_spl_vec = R @ gnm_spl_vec
-    del R
-    Clear_Ram()
-
-
-    gnm_filt_spl = np.reshape(
-        gnm_filt_spl_vec,
-        gnm_spl.shape,
-        order="F"
-    )
-
-    return(gnm_filt_spl)'''
-
-# %% function to generate simple gauss coefficient data sets
+# function to generate simple gauss coefficient data sets
 
 def Simple_G_Generate(setup, times):
     gnm = np.zeros((148, 440)) # N = 20 gauss time series template
@@ -293,7 +274,7 @@ def Simple_G_Generate(setup, times):
 
     return(gnm)
 
-# %% function to generate simple gauss coefficient data sets
+# function to generate simple gauss coefficient data sets
 
 def Simple_G_Generate_One(s, f, times):
     gnm = np.zeros((148, 440)) # N = 20 gauss time series template
@@ -310,7 +291,7 @@ def Simple_G_Generate_One(s, f, times):
 
     return(gnm, gsv_nm, gsa_nm)
 
-# %% defining functions for performance evaluation
+# defining functions for performance evaluation
 
 # takes in gnm (nt, ng) and finds total naive power
 def Power_g(gnm, s=None, type='total'):
@@ -412,51 +393,87 @@ def fit_sinusoid_frequency( y,t, f_min=0.001, f_max=1, n_grid=200, refine=True):
         "rel_resid": rel_resid,
         "fit": y_fit,
     }
-# %% RUN DIAGNOSTICS FOR MF, SV, SA
 
-coeff_indices = degrees_idx-1
-coeff_periods = np.array([1, 2, 4, 8, 16, 24, 32, 40, 48, 64])
+# %% run a simple example for one input s gauss
+
+# %% RECORDING IMPORTANT TIME POINTS HERE FOR FUTURE USE:
+t_r_start = 1997.1
+dt_years = 0.2
+
+notable_times_raw = {
+    "CHAMP Start (2000/08)": 2000 + 8/12,
+    "CHAMP End (2010/09)": 2010 + 9/12,
+    "SWARM Start (2013/11)": 2013 + 11/12,
+    "(2026/01)": 2026
+}
+
+notable_times_relative = {}
+notable_times_aspline = {}
+
+for event in notable_times_raw:
+    notable_times_relative[event] = \
+        (notable_times_raw[event] - t_r_start)
+    
+# %% building reliable time indices
+
+reliable_t_start = notable_times_relative["CHAMP Start (2000/08)"]
+reliable_t_end = notable_times_relative["(2026/01)"]
+
+
+reliable_mask_t = (times_dyear > reliable_t_start) & (times_dyear < reliable_t_end)
+
+# %%
+coeff_indices = degrees_idx -1
+
+coeff_periods = np.array([
+    2, 4, 6, 8, 10, 14, 18, 22, 26, 30, 35, 40, 50, 60, 70
+])
+
 coeff_frequency = 1 / coeff_periods
 
-start_reliable_idx, end_reliable_idx = 9, 58
-times_reliable = times_dyear[start_reliable_idx:end_reliable_idx]
+times_reliable = times_dyear[reliable_mask_t]
 
-# Read these once, not inside every loop
+fields = ("MF", "SV", "SA")
+
+# Read matrices once
 P = R_Read_In("P", "MF")
 
 H = {
-    "MF": R_Read_In("H", "MF"),
-    "SV": R_Read_In("H", "SV"),
-    "SA": R_Read_In("H", "SA"),
+    field: R_Read_In("H", field)
+    for field in fields
 }
 
 summary_stats = {
     field: {
-        "total_retained_power_frac": [],
-        "s_power_vs_total_power_frac": [],
-        "sin_fit": [],
-        "sin_fit_r2": [],
+        "signal_power_retained_frac": [],
+        "frequency_fit_error": [],
     }
-    for field in ["MF", "SV", "SA"]
+    for field in fields
 }
+
 
 for f in tqdm(coeff_frequency, desc="Frequencies"):
 
-    # temporary storage for this frequency
     f_stats = {
         field: {
-            "total_retained_power_frac": [],
-            "s_power_vs_total_power_frac": [],
-            "sin_fit": [],
-            "sin_fit_r2": [],
+            "signal_power_retained_frac": [],
+            "frequency_fit_error": [],
         }
-        for field in ["MF", "SV", "SA"]
+        for field in fields
     }
 
-    for s in tqdm(coeff_indices, desc=f"coefficients, f={f:.4f}", leave=False):
+    for s in tqdm(
+        coeff_indices,
+        desc=f"coefficients, f={f:.4f}",
+        leave=False,
+    ):
 
-        # Generate simple input signal in MF, SV, SA
-        gnm, gsv_nm, gsa_nm = Simple_G_Generate_One(s, f, times_dyear)
+        # Generate input signal in MF, SV and SA
+        gnm, gsv_nm, gsa_nm = Simple_G_Generate_One(
+            s,
+            f,
+            times_dyear,
+        )
 
         original = {
             "MF": gnm,
@@ -464,91 +481,132 @@ for f in tqdm(coeff_frequency, desc="Frequencies"):
             "SA": gsa_nm,
         }
 
-        # Apply resolution in spline space
+        # Apply resolution in spline-coefficient space
         gnm_spl = P @ gnm
         gnm_filt_spl = Sparse_R_Apply_One(gnm_spl, s)
 
-        # Reconstruct filtered MF, SV, SA from filtered spline coefficients
+        # Reconstruct filtered MF, SV and SA
         filtered = {
             field: H[field] @ gnm_filt_spl
-            for field in ["MF", "SV", "SA"]
+            for field in fields
         }
 
-        for field in ["MF", "SV", "SA"]:
+        for field in fields:
 
-            original_clip = original[field][start_reliable_idx:end_reliable_idx, :]
-            filtered_clip = filtered[field][start_reliable_idx:end_reliable_idx, :]
+            original_clip = original[field][
+                reliable_mask_t,
+                :
+            ]
 
-            # Total power before and after resolution
-            tot_power_original = Power_g(original_clip)
-            tot_power_filtered = Power_g(filtered_clip)
+            filtered_clip = filtered[field][
+                reliable_mask_t,
+                :
+            ]
 
-            # Power retained in injected coefficient s vs leaked elsewhere
-            s_power_filtered, rest_power_filtered = Power_g(
+            # Total input power
+            input_power = Power_g(original_clip)
+
+            # Filtered power remaining in injected coefficient s
+            s_power_filtered, _ = Power_g(
                 filtered_clip,
                 s=s,
-                type="s_band"
+                type="s_band",
             )
 
-            f_stats[field]["s_power_vs_total_power_frac"].append(
-                s_power_filtered / tot_power_filtered
+            signal_power_retained_frac = (
+                s_power_filtered / input_power
+                if input_power > 0
+                else np.nan
             )
 
-            f_stats[field]["total_retained_power_frac"].append(
-                tot_power_filtered / tot_power_original
+            f_stats[field]["signal_power_retained_frac"].append(
+                signal_power_retained_frac
             )
 
-            # Frequency fitted to the filtered version of the injected coefficient
-            sin_fit_result_s = fit_sinusoid_frequency(
+            # Fit frequency to filtered injected coefficient
+            sin_fit_result = fit_sinusoid_frequency(
                 filtered_clip[:, s],
-                t=times_reliable
+                t=times_reliable,
             )
 
-            f_stats[field]["sin_fit"].append(
-                (sin_fit_result_s["frequency"] - f) / f
+            fitted_frequency = sin_fit_result["frequency"]
+            fit_r2 = sin_fit_result["r2"]
+
+            signed_frequency_error = (
+                fitted_frequency - f
+            ) / f
+
+            # Only retain frequency error for reliable coherent signals
+            valid_frequency_fit = (
+                fit_r2 > 0.99
+                and signal_power_retained_frac > 0.1
             )
 
-            f_stats[field]["sin_fit_r2"].append(
-                sin_fit_result_s["r2"]
-            )
+            if valid_frequency_fit:
+                f_stats[field]["frequency_fit_error"].append(
+                    signed_frequency_error
+                )
+            else:
+                f_stats[field]["frequency_fit_error"].append(
+                    np.nan
+                )
 
-    # store one list per frequency
-    for field in ["MF", "SV", "SA"]:
+    # Store one row per frequency
+    for field in fields:
         for key in summary_stats[field]:
-            summary_stats[field][key].append(f_stats[field][key])
+            summary_stats[field][key].append(
+                f_stats[field][key]
+            )
 
-# %%
+# %% USEFUL PLOTTING METRICS
 
-from matplotlib.colors import LogNorm
-
-import numpy as np
-import matplotlib.pyplot as plt
-
-
-def get_global_diagnostic_scales(summary_stats, fields=("MF", "SV", "SA")):
+def get_global_diagnostic_scales(
+    summary_stats,
+    fields=("MF", "SV", "SA"),
+):
     """
-    Compute global colour limits across MF, SV, SA for each diagnostic.
+    Compute common colour limits across MF, SV and SA.
     """
 
-    scales = {}
+    scales = {
+        "signal_power_retained_frac": (0, 1),
+    }
 
-    # Fractions and R2 are naturally 0 to 1
-    scales["total_retained_power_frac"] = (0, 1)
-    scales["s_power_vs_total_power_frac"] = (0, 1)
-    scales["sin_fit_r2"] = (0, 1)
-
-    # Signed frequency error: use symmetric colour scale around zero
-    all_freq_err = []
+    all_frequency_errors = []
 
     for field in fields:
-        Z = np.asarray(summary_stats[field]["sin_fit"], dtype=float)
-        all_freq_err.append(Z[np.isfinite(Z)])
+        Z = np.asarray(
+            summary_stats[field]["frequency_fit_error"],
+            dtype=float,
+        )
 
-    all_freq_err = np.concatenate(all_freq_err)
+        finite_values = Z[np.isfinite(Z)]
 
-    freq_err_absmax = np.nanmax(np.abs(all_freq_err))
+        if finite_values.size > 0:
+            all_frequency_errors.append(finite_values)
 
-    scales["sin_fit"] = (-freq_err_absmax, freq_err_absmax)
+    if all_frequency_errors:
+        all_frequency_errors = np.concatenate(
+            all_frequency_errors
+        )
+
+        frequency_absmax = np.nanmax(
+            np.abs(all_frequency_errors)
+        )
+
+        # Prevent a zero-width colour scale
+        frequency_absmax = max(
+            frequency_absmax,
+            1e-12,
+        )
+
+        scales["frequency_fit_error"] = (
+            -0.5,
+            0.5,
+        )
+
+    else:
+        scales["frequency_fit_error"] = (-1, 1)
 
     return scales
 
@@ -559,64 +617,67 @@ def plot_field_diagnostics(
     coeff_periods,
     degrees_idx=None,
     global_scales=None,
-    figsize=(15, 10),
+    figsize=(text_width, 0.5*text_width),
 ):
     """
-    Plot pcolormesh diagnostic suite for one field: MF, SV, or SA.
+    Plot two resolution diagnostics:
 
-    summary_stats[field][diagnostic] should have shape:
-        (n_periods, n_coefficients)
+    1. Power remaining in the injected coefficient relative to
+       the original input power.
 
-    Period axis is plotted in real years, linearly from 0 to 100 yr.
+    2. Signed relative frequency error, shown only where:
+           R² > 0.99
+       and P_s / P_input > 0.1.
     """
 
     diagnostics = {
-        "total_retained_power_frac": {
-            "title": "Total retained power fraction",
-            "cbar": r"$P_\mathrm{filtered} / P_\mathrm{input}$",
+        "signal_power_retained_frac": {
+            "title": (
+                "Power retained in injected coefficient"
+            ),
+            "cbar": (
+                r"$P_s^\mathrm{filtered}"
+                r" / P_\mathrm{input}$"
+            ),
+            "cmap": "viridis",
             "default_vmin": 0,
             "default_vmax": 1,
-            "cmap": "viridis",
         },
-        "s_power_vs_total_power_frac": {
-            "title": "Injected coefficient power fraction",
-            "cbar": r"$P_s / P_\mathrm{filtered}$",
-            "default_vmin": 0,
-            "default_vmax": 1,
-            "cmap": "viridis",
-        },
-        "sin_fit": {
-            "title": "Signed normalised frequency error",
-            "cbar": r"$(\hat{f} - f) / f$",
+        "frequency_fit_error": {
+            "title": (
+                "Reliable signed frequency error"
+                "\n"
+                r"$R^2>0.99$ and "
+                r"$P_s/P_\mathrm{input}>0.1$"
+            ),
+            "cbar": r"$(\hat{f}-f)/f$",
+            "cmap": "RdBu_r",
             "default_vmin": -1,
             "default_vmax": 1,
-            "cmap": "RdBu_r",
-        },
-        "sin_fit_r2": {
-            "title": "Sinusoid fit $R^2$",
-            "cbar": r"$R^2$",
-            "default_vmin": 0,
-            "default_vmax": 1,
-            "cmap": "viridis",
         },
     }
 
     x_vals = np.asarray(coeff_indices)
     y_vals = np.asarray(coeff_periods)
 
-    fig, ax = plt.subplots(
-        2, 2,
+    fig, axes = plt.subplots(
+        1,
+        2,
         figsize=figsize,
         constrained_layout=True,
         sharex=True,
         sharey=True,
     )
 
-    ax = ax.ravel()
+    for ax, (key, meta) in zip(
+        axes,
+        diagnostics.items(),
+    ):
 
-    for a, (key, meta) in zip(ax, diagnostics.items()):
-
-        Z = np.asarray(summary_stats[field][key], dtype=float)
+        Z = np.asarray(
+            summary_stats[field][key],
+            dtype=float,
+        )
 
         if global_scales is not None:
             vmin, vmax = global_scales[key]
@@ -624,17 +685,18 @@ def plot_field_diagnostics(
             vmin = meta["default_vmin"]
             vmax = meta["default_vmax"]
 
-        if key == "sin_fit":
-            absmax = np.nanmax(np.abs(Z))
-            vmin, vmax = -1, 1
+        cmap = plt.get_cmap(meta["cmap"]).copy()
 
+        if key == "frequency_fit_error":
+            Z = np.ma.masked_invalid(Z)
+            cmap.set_bad("black")
 
-        pcm = a.pcolormesh(
+        pcm = ax.pcolormesh(
             x_vals,
             y_vals,
             Z,
             shading="auto",
-            cmap=meta["cmap"],
+            cmap=cmap,
             vmin=vmin,
             vmax=vmax,
         )
@@ -642,7 +704,7 @@ def plot_field_diagnostics(
         if degrees_idx is not None:
             for idx in degrees_idx:
                 if x_vals[0] <= idx <= x_vals[-1]:
-                    a.axvline(
+                    ax.axvline(
                         idx,
                         color="red",
                         linestyle="--",
@@ -650,28 +712,44 @@ def plot_field_diagnostics(
                         alpha=0.8,
                     )
 
-        a.set_title(meta["title"])
-        a.set_xlabel("input Gauss coefficient index $s$")
-        a.set_ylabel("input period / yr")
+        ax.set_title(meta["title"])
+        ax.set_xlabel(
+            r"input Gauss coefficient index $s$"
+        )
+        ax.set_ylabel("input period / yr")
+        ax.set_ylim(2, 70)
+        ax.grid(True, alpha=0.25)
 
-        a.set_ylim(0, 80)
-        a.grid(True, alpha=0.25)
+        cbar = fig.colorbar(
+            pcm,
+            ax=ax,
+        )
 
-        cbar = fig.colorbar(pcm, ax=a)
-        cbar.set_label(meta["cbar"])
+        cbar.set_label(
+            meta["cbar"]
+        )
 
-    fig.suptitle(f"{field} resolution diagnostics", fontsize=16)
+    fig.suptitle(
+        f"{field} resolution diagnostics",
+        fontsize=16,
+    )
+
+    plt.savefig(
+        f"{FIG_DIR}/final/{field}_R_diagnostics.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
 
     plt.show()
 
-    return fig, ax
-# %%
+    return fig, axes
+
 global_scales = get_global_diagnostic_scales(
     summary_stats,
-    fields=("MF", "SV", "SA")
+    fields=fields,
 )
 
-for field in ["MF", "SV", "SA"]:
+for field in fields:
     plot_field_diagnostics(
         summary_stats,
         field=field,
@@ -680,162 +758,4 @@ for field in ["MF", "SV", "SA"]:
         degrees_idx=degrees_idx,
         global_scales=global_scales,
     )
-# %%
-
-plt.plot(coeff_indices, summary_stats["total_retained_power_frac"])
-for marker in degrees_idx:
-    plt.axvline(marker)
-# %%
-plt.imshow(gnm_filt)
-# %%
-plt.imshow(gnm_sv_filt)
-
-#%%
-plt.imshow(gnm_sa_filt)
-# %% Defining functions to transform between physical and gauss
-
-# -------------------- BELOW IS GOOD CODE, BUT NOT CURRENTLY WANTED TO USE --------------------------
-
-# these need to be in degrees for chaosmagpy
-theta_v = np.rad2deg(theta_grid.copy().ravel())
-phi_v = np.rad2deg(phi_grid.copy().ravel())
-radius_v = np.full(len(phi_v), radius)
-
-# gauss -> physical forward operators
-# using nmax = 20
-A_r, A_t, A_p = cp.model_utils.design_gauss(
-    radius_v, theta_v, phi_v, nmax=20, source="internal"
-)
-
-A_20_dict = {"r": A_r, "theta": A_t, "phi": A_p}
-
-# %% need a way to convert gauss back to physical grid for video
-
-# gets gauss coefficient time series, retrieves physical grid time series of radial component
-def Gauss_To_Grid_Time_Series(G, A_r=A_20_dict["r"], state_shape=(181, 360)):
-
-    n_times, n_coeffs = G.shape # G ~ nt, ncoeffs
-    n_grid = np.prod(state_shape) # n_grid = 360 x 181
-
-    if A_r.shape != (n_grid, n_coeffs):
-        raise ValueError(
-            f"Expected A_r shape {(n_grid, n_coeffs)}, got {A_r.shape}"
-        )
-
-    grid_v = A_r @ G.T                     # (n_grid, n_times)
-    grid = grid_v.T.reshape(n_times, *state_shape) # (nt, ntheta, nphi)
-
-    return grid
-
-# %% converting to gridded physical data
-
-pre_resolution_br = Gauss_To_Grid_Time_Series(gnm)
-post_resolution_br = Gauss_To_Grid_Time_Series(gnm_filt)
-
-# %% making movie
-# converts a state vector series array ((ntheta*nphi), nt) into a cube (nt, ntheta, nphi)
-# not used here, but required for below to compile
-def Series_To_Cube(series, state_shape=state_shape):
-
-    return series.T.reshape((series.shape[1], *state_shape))
-
-def Cube_Movie(series, name="data_cube", fig_dir=FIG_DIR, fps=10, cmap="seismic"):
-    """
-    data_cube shape: (nt, nlat, nlon)
-    """
-    if series.ndim == 2: # convet to cube if ravelled state series
-        cube = Series_To_Cube(series)
-    else:
-        cube = series
-
-    os.makedirs(fig_dir, exist_ok=True)
-
-    nt = cube.shape[0]
-
-    vmax = np.nanmax(np.abs(cube))
-    vmin = -vmax
-
-    fig, ax = plt.subplots(figsize=(10, 5), dpi=150)
-
-    im = ax.imshow(
-        cube[0],
-        cmap=cmap,
-        origin="upper",
-        extent=[0, 360, 180, 0],
-        aspect="auto",
-        vmin=vmin,
-        vmax=vmax
-    )
-
-    ax.set_xlabel("Longitude [°]")
-    ax.set_ylabel("Colatitude [°]")
-
-    title = ax.set_title(f"{name} | frame 0/{nt-1}")
-
-    cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label(name)
-
-    def update(frame):
-        im.set_data(cube[frame])
-        title.set_text(f"{name} | frame {frame}/{nt-1}")
-        return im, title
-
-    anim = FuncAnimation(
-        fig,
-        update,
-        frames=nt,
-        interval=1000 / fps,
-        blit=True
-    )
-
-    filename = os.path.join(fig_dir, f"{name}.mp4")
-    anim.save(filename, fps=fps, dpi=150)
-
-    plt.close(fig)
-
-    return filename
-
-Cube_Movie(pre_resolution_br, name=f"{test_name}_br_pre_res")
-Cube_Movie(post_resolution_br, name=f"{test_name}_br_post_res")
-# %%
-
-def Plot_3D_Surface(M, title="3D matrix surface", xlabel="Gauss coefficient index",
-                    ylabel="Spline coefficient index", zlabel="Amplitude",
-                    max_abs=None, stride=20):
-
-    M_plot = np.asarray(M)
-
-    # Optional downsampling for large matrices
-    M_plot = M_plot[::, ::stride]
-
-    y = np.arange(M_plot.shape[0])   # spline index
-    x = np.arange(M_plot.shape[1])   # Gauss index
-    X, Y = np.meshgrid(x, y)
-
-    fig = plt.figure(figsize=(12, 7))
-    ax = fig.add_subplot(111, projection="3d")
-
-    surf = ax.plot_surface(
-        X, Y, M_plot,
-        cmap="viridis",
-        linewidth=0,
-        antialiased=True
-    )
-
-    ax.set_title(title)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    ax.set_zlabel(zlabel)
-
-    fig.colorbar(surf, ax=ax, shrink=0.6, aspect=15, label=zlabel)
-
-    if max_abs is not None:
-        ax.set_zlim(-max_abs, max_abs)
-
-    plt.tight_layout()
-    plt.show()
-
-Plot_3D_Surface(gnm_filt)
-# %%
-Plot_3D_Surface(gnm)
 # %%
