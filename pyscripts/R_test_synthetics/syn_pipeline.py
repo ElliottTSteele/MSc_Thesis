@@ -444,9 +444,9 @@ def Lowes_Degree_PSD_All_Degrees(gnm, a, r, f_sample=1/dt_years, degrees=degrees
             fs=f_sample,
             a=a,
             r=r,
-            detrend="linear",
+            detrend="constant",
             window="hann",
-            scaling="density",
+            scaling="spectrum",
         )
 
         degree_psds.append(degree_psd)

@@ -1,0 +1,634 @@
+'''
+Plan:
+
+investigating simple optimised dmd
+on a single wave case
+'''
+
+# PREAMBLE
+# %% SETTING UP AUTOUPDATES
+
+from IPython import get_ipython
+
+ipython = get_ipython()
+if ipython is not None:
+    ipython.run_line_magic("load_ext", "autoreload")
+    ipython.run_line_magic("autoreload", "2")
+
+# %% FILE SYSTEM AND DEPENDENCY SETUP
+
+import sys
+from pathlib import Path
+print(sys.path)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+import numpy as np
+import matplotlib.pyplot as plt
+import h5py
+import gc
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+import chaosmagpy as cp
+from tqdm import tqdm
+from matplotlib.colors import LogNorm
+from matplotlib import cm
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+import chaosmagpy as cp
+
+import os
+import sys
+import pydmd
+import cmath
+import copy
+import h5py
+import math
+import pickle
+import gc
+import pydmd
+
+from pathlib import Path
+from scipy.signal import periodogram
+from matplotlib.animation import FuncAnimation
+from IPython.display import Video
+from tqdm import tqdm
+from scipy.interpolate import make_interp_spline
+from chaosmagpy.chaos import BaseModel
+
+# importing from pyDMD
+from pydmd import BOPDMD
+
+# import paths.py to establish file structure and directories
+from src.msc_thesis.paths import *
+
+# import simulation setup
+from src.msc_thesis.synSetup import *
+from src.msc_thesis.synUtils import *
+from src.msc_thesis.synDMD import *
+
+import numpy as np
+
+
+# %% ------------------------------------------------------
+# SIMULATION SETUP
+# ---------------------------------------------------------
+
+# put list of mode numbers used
+mode_numbers = np.arange(1, 63, 1)
+mode_numbers = [str(num) for num in mode_numbers]
+
+# - if windowing to 'high quality' record
+high_q_flag = True
+#   - how often to sub-sample time series (1 = full sampling)
+n_skip = 1
+
+# deciding on spherical harmonic truncation degree
+Nmax = 20
+A_r_20 = A_20_dict["r"]
+A_r = Truncate_Gauss_Coeffs(A_r_20, tmax=Nmax)
+
+A_t = A_20_dict["phi"]
+A_comp = A_t
+# ---------------------------------------------------------
+# DECIDING HOW TO DIVIDE EARTH REGIONALLY
+# ---------------------------------------------------------
+
+region_names = [
+    "Southern",
+    "Equatorial",
+    "Northern"
+]
+
+def regional_wave_power(
+    wave,
+    latitudes,
+    longitudes=None,
+    remove_temporal_mean=False,
+):
+
+    wave = np.asarray(wave)
+    latitudes = np.asarray(latitudes)
+
+    # Add a time dimension for a static spatial mode
+    if wave.ndim == 2:
+        wave = wave[None, :, :]
+
+    if wave.ndim != 3:
+        raise ValueError(
+            "wave must have shape (nt, nlat, nlon) or (nlat, nlon)"
+        )
+
+    nt, nlat, nlon = wave.shape
+
+    if len(latitudes) != nlat:
+        raise ValueError("latitudes does not match the wave latitude dimension")
+
+    if longitudes is not None and len(longitudes) != nlon:
+        raise ValueError("longitudes does not match the wave longitude dimension")
+
+    if remove_temporal_mean and nt > 1:
+        wave = wave - np.mean(wave, axis=0, keepdims=True)
+
+    # Correct spherical-area weighting for a regular lat-lon grid
+    latitude_weights = np.cos(np.deg2rad(latitudes))
+
+    # Expand across longitude
+    area_weights = np.broadcast_to(
+        latitude_weights[:, None],
+        (nlat, nlon),
+    )
+
+    # Works for both real time series and complex mode phasors
+    point_power = np.mean(np.abs(wave) ** 2, axis=0)
+
+    region_masks = {
+        "Southern": latitudes < -30,
+        "Equatorial": (latitudes >= -30) & (latitudes <= 30),
+        "Northern": latitudes > 30,
+    }
+
+    integrated_power = {}
+    represented_area = {}
+
+    for name, latitude_mask in region_masks.items():
+
+        weights_region = area_weights[latitude_mask, :]
+        power_region = point_power[latitude_mask, :]
+
+        integrated_power[name] = np.sum(
+            weights_region * power_region
+        )
+
+        represented_area[name] = np.sum(weights_region)
+
+    global_power = sum(integrated_power.values())
+    global_area = sum(represented_area.values())
+
+    global_mean_square = global_power / global_area
+
+    results = {}
+
+    for name in region_masks:
+
+        mean_square = (
+            integrated_power[name] / represented_area[name]
+        )
+
+        results[name] = {
+            "mean_square": mean_square,
+            "rms": np.sqrt(mean_square),
+            "total_power": integrated_power[name],
+            "power_fraction": (
+                integrated_power[name] / global_power
+                if global_power > 0 else np.nan
+            ),
+            "area_fraction": represented_area[name] / global_area,
+
+            # >1 means preferentially concentrated in this region
+            "concentration": (
+                mean_square / global_mean_square
+                if global_mean_square > 0 else np.nan
+            ),
+        }
+    return results
+
+def regional_signal_distortion(
+    signal_input,
+    signal_resolved,
+    latitudes,
+    longitudes=None,
+    remove_temporal_mean=False,
+    include_global=True,
+):
+    """
+    Calculate area-weighted signal distortion ratio between an input
+    wave and its resolved version in different latitude regions.
+
+    SDR_R = weighted input signal power / weighted error power
+
+    Parameters
+    ----------
+    signal_input : ndarray, shape (nt, nlat, nlon)
+        Original input SV grid time series.
+
+    signal_resolved : ndarray, shape (nt, nlat, nlon)
+        Resolved SV grid time series.
+
+    latitudes : ndarray, shape (nlat,)
+        Grid latitudes in degrees.
+
+    longitudes : ndarray, optional
+        Grid longitudes, used for shape checking.
+
+    remove_temporal_mean : bool, default=False
+        If True, remove the temporal mean from both signals before
+        calculating SDR.
+
+    include_global : bool, default=True
+        Include a whole-Earth result for comparison.
+
+    Returns
+    -------
+    results : dict
+        For each region:
+
+            signal_power
+                Area-weighted integrated input power.
+
+            resolved_power
+                Area-weighted integrated resolved power.
+
+            error_power
+                Area-weighted integrated squared error.
+
+            sdr
+                Linear signal distortion ratio.
+
+            sdr_db
+                SDR in decibels: 10 log10(SDR).
+
+            relative_rmse
+                sqrt(error_power / signal_power).
+
+            power_retention
+                resolved_power / signal_power.
+    """
+
+    signal_input = np.asarray(signal_input)
+    signal_resolved = np.asarray(signal_resolved)
+    latitudes = np.asarray(latitudes)
+
+    if signal_input.shape != signal_resolved.shape:
+        raise ValueError(
+            "Input and resolved signals must have the same shape. "
+            f"Received {signal_input.shape} and {signal_resolved.shape}."
+        )
+
+    if signal_input.ndim != 3:
+        raise ValueError(
+            "Signals must have shape (nt, nlat, nlon)."
+        )
+
+    nt, nlat, nlon = signal_input.shape
+
+    if len(latitudes) != nlat:
+        raise ValueError(
+            "latitudes does not match the signal latitude dimension"
+        )
+
+    if longitudes is not None and len(longitudes) != nlon:
+        raise ValueError(
+            "longitudes does not match the signal longitude dimension"
+        )
+
+    if remove_temporal_mean:
+        signal_input = (
+            signal_input
+            - np.mean(signal_input, axis=0, keepdims=True)
+        )
+
+        signal_resolved = (
+            signal_resolved
+            - np.mean(signal_resolved, axis=0, keepdims=True)
+        )
+
+    # Resolution-induced error
+    error = signal_input - signal_resolved
+
+    # Spherical area weights for a regular latitude-longitude grid
+    latitude_weights = np.cos(np.deg2rad(latitudes))
+
+    area_weights = np.broadcast_to(
+        latitude_weights[:, None],
+        (nlat, nlon),
+    )
+
+    region_masks = {
+        "Southern": latitudes < -30,
+        "Equatorial": (latitudes >= -30) & (latitudes <= 30),
+        "Northern": latitudes > 30,
+    }
+
+    if include_global:
+        region_masks["Global"] = np.ones(nlat, dtype=bool)
+
+    results = {}
+
+    for region, latitude_mask in region_masks.items():
+
+        weights_region = area_weights[latitude_mask, :]
+
+        input_region = signal_input[:, latitude_mask, :]
+        resolved_region = signal_resolved[:, latitude_mask, :]
+        error_region = error[:, latitude_mask, :]
+
+        # Add time dimension to the spatial area weights
+        weights_3d = weights_region[None, :, :]
+
+        signal_power = np.sum(
+            weights_3d * np.abs(input_region) ** 2
+        )
+
+        resolved_power = np.sum(
+            weights_3d * np.abs(resolved_region) ** 2
+        )
+
+        error_power = np.sum(
+            weights_3d * np.abs(error_region) ** 2
+        )
+
+        if signal_power > 0:
+            relative_rmse = np.sqrt(error_power / signal_power)
+            power_retention = resolved_power / signal_power
+        else:
+            relative_rmse = np.nan
+            power_retention = np.nan
+
+        if error_power > 0:
+            sdr = signal_power / error_power
+            sdr_db = 10 * np.log10(sdr)
+        elif signal_power > 0:
+            sdr = np.inf
+            sdr_db = np.inf
+        else:
+            sdr = np.nan
+            sdr_db = np.nan
+
+        results[region] = {
+            "signal_power": signal_power,
+            "resolved_power": resolved_power,
+            "error_power": error_power,
+            "sdr": sdr,
+            "sdr_db": sdr_db,
+            "relative_rmse": relative_rmse,
+            "power_retention": power_retention,
+        }
+
+    return results
+#  %% -----------------------------------------------------
+# OBTAIN INPUT DATA
+# ---------------------------------------------------------
+
+file_path = Path(FELIX_DIR) / "R_splines_arbitrary.h5"
+
+# record dmd recovery results
+DMD_recovery = {}
+
+# dictionaries for storing results
+
+regional_power_dict = {}
+regional_sdr_dict = {}
+periods = []
+
+with h5py.File(file_path, "r") as h5_file:
+
+    gnm_total_res_list = []
+    synthetic_suite_info = {}
+
+    for mode_number in tqdm(mode_numbers):
+
+        # initialising mode info storage
+        mode_info = {}
+        mode_info[mode_number] = {}
+
+        # loading in the data
+        mode_data = Component_Load_SV(mode_number)
+
+        # getting:
+
+        #   - eigenvalue
+        #       - without decay
+        eigenvalue = mode_data["eigenvalue"]
+        #       - with decay
+        eigenvalue_decaying = mode_data["eigenvalue_decaying"]
+
+        # getting period
+        period = (2*np.pi)/(eigenvalue.imag)
+        periods.append(period)
+
+        #   - gnm phasor
+        gnm_phasor = mode_data["gnm"]
+        #       - truncating to N=20
+        gnm_phasor_T = Truncate_Gauss_Coeffs(gnm_phasor, tmax=20)
+        #       - getting time series array
+        gnm_input = G_Time_Series_Eval(gnm_phasor_T, eigenvalue)
+        #       - projecting to SV lat-lon grid time series
+        sv_input_flattened = A_comp @ gnm_input.T
+        sv_input = Series_To_Cube(sv_input_flattened)
+
+        #   - resolved spline
+        gnm_spl = np.asarray(
+            h5_file[f"mode_{mode_number}/without_decay"][()]
+        )
+        #       - converting to SV gnm time series
+        gnm_sv_resolved = H_sv @ gnm_spl
+        #       - projecting to SV lat-lon grid time series
+        sv_resolved_flattened = A_comp @ gnm_sv_resolved.T
+        sv_resolved = Series_To_Cube(sv_resolved_flattened)
+
+        #   - scaling factor (avoid use if possible - keep arbitrary)
+        amp_scaler = mode_amp_scalings[str(mode_number)]
+
+        if high_q_flag:
+            sv_resolved = sv_resolved[good_record_slice]
+            sv_input = sv_input[good_record_slice]
+
+
+        # computing regional wave power
+        #   - for input
+
+        results_input = regional_wave_power(sv_input, latitude)
+        #   - for resolved
+        results_resolved = regional_wave_power(sv_resolved, latitude)
+
+        # Calculate regional preservation/distortion caused by resolution
+        regional_sdr_results = regional_signal_distortion(
+            signal_input=sv_input,
+            signal_resolved=sv_resolved,
+            latitudes=latitude,
+            remove_temporal_mean=False,
+            include_global=True,
+        )
+
+        regional_sdr_dict[mode_number] = regional_sdr_results
+
+        regional_power_dict_entry = {
+            "input":{},
+            "resolved":{}
+        }
+
+        # appending results
+        for region in region_names:
+            in_reg_rms = results_input[region]["concentration"]
+            res_reg_rms = results_resolved[region]["concentration"]
+
+            regional_power_dict_entry["input"][region] = in_reg_rms
+            regional_power_dict_entry["resolved"][region] = res_reg_rms
+
+        regional_power_dict[mode_number] = regional_power_dict_entry
+
+# %%
+north_power = [
+    regional_power_dict[m]["input"]["Northern"]
+    for m in mode_numbers
+]
+
+eq_power = [
+    regional_power_dict[m]["input"]["Equatorial"]
+    for m in mode_numbers
+]
+
+south_power = [
+    regional_power_dict[m]["input"]["Southern"]
+    for m in mode_numbers
+]
+
+fig, ax = plt.subplots(figsize=(8, 5))
+
+ax.scatter(periods, north_power, marker="x", color="blue",
+           s=25, label="Northern")
+ax.scatter(periods, eq_power, marker="x", color="black",
+           s=25, label="Equatorial")
+ax.scatter(periods, south_power, marker="o", color="red",
+           s=18, label="Southern")
+
+ax.axhline(
+    1,
+    color="grey",
+    linestyle="--",
+    linewidth=1,
+    label="Uniform spatial power",
+)
+
+ax.set_xlabel("Mode period [yr]")
+ax.set_ylabel("Regional power concentration")
+ax.legend()
+fig.tight_layout()
+# %%
+# %%
+north_power = [
+    regional_power_dict[m]["resolved"]["Northern"]
+    for m in mode_numbers
+]
+
+eq_power = [
+    regional_power_dict[m]["resolved"]["Equatorial"]
+    for m in mode_numbers
+]
+
+south_power = [
+    regional_power_dict[m]["resolved"]["Southern"]
+    for m in mode_numbers
+]
+
+fig, ax = plt.subplots(figsize=(8, 5))
+
+ax.scatter(periods, north_power, marker="x", color="blue",
+           s=25, label="Northern")
+ax.scatter(periods, eq_power, marker="x", color="black",
+           s=25, label="Equatorial")
+ax.scatter(periods, south_power, marker="o", color="red",
+           s=18, label="Southern")
+
+ax.axhline(
+    1,
+    color="grey",
+    linestyle="--",
+    linewidth=1,
+    label="Uniform spatial power",
+)
+
+ax.set_xlabel("Mode period [yr]")
+ax.set_ylabel("Regional power concentration")
+ax.legend()
+fig.tight_layout()
+
+fig, ax = plt.subplots(figsize=(8, 5))
+
+region_styles = {
+    "Northern": {
+        "color": "blue",
+        "marker": "x",
+    },
+    "Equatorial": {
+        "color": "black",
+        "marker": "x",
+    },
+    "Southern": {
+        "color": "red",
+        "marker": "o",
+    },
+    "Global": {
+        "color": "green",
+        "marker": "s",
+    },
+}
+
+for region, style in region_styles.items():
+
+    sdr_values = [
+        regional_sdr_dict[mode_number][region]["sdr_db"]
+        for mode_number in mode_numbers
+    ]
+
+    ax.scatter(
+        periods,
+        sdr_values,
+        color=style["color"],
+        marker=style["marker"],
+        s=25,
+        label=region,
+    )
+
+ax.axhline(
+    0,
+    color="grey",
+    linestyle="--",
+    linewidth=1,
+    label="Signal power = distortion power",
+)
+
+ax.set_xlabel("Mode period [yr]")
+ax.set_ylabel("Signal distortion ratio [dB]")
+ax.legend()
+fig.tight_layout()
+
+fig, ax = plt.subplots(figsize=(8, 5))
+
+for region, style in region_styles.items():
+
+    retention_values = [
+        regional_sdr_dict[mode_number][region]["power_retention"]
+        for mode_number in mode_numbers
+    ]
+
+    ax.scatter(
+        periods,
+        retention_values,
+        color=style["color"],
+        marker=style["marker"],
+        s=25,
+        label=region,
+    )
+
+ax.axhline(
+    1,
+    color="grey",
+    linestyle="--",
+    linewidth=1,
+    label="Perfect power retention",
+)
+
+ax.set_xlabel("Mode period [yr]")
+ax.set_ylabel("Resolved/input regional power")
+ax.set_yscale("log")
+ax.legend()
+fig.tight_layout()
+
+# %%
+periods = np.asarray(periods)
+print(periods[periods<10])
+# %%

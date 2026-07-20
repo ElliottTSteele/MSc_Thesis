@@ -40,7 +40,7 @@ from matplotlib.colors import LogNorm, ListedColormap, BoundaryNorm
 r_choice = r_cmb
 mode_numbers = np.arange(1, 63)
 
-n_selected_modes = 12
+n_selected_modes = 8
 random_seed = 2
 n_restarts = 3
 annealing_steps = 1200
@@ -48,10 +48,10 @@ temperature_start = 0.05
 temperature_end = 1e-4
 max_swap_passes = 4
 
-degree_min, degree_max = 1, 8
-frequency_min, frequency_max = 0.0, 0.2
+degree_min, degree_max = 1, 10
+frequency_min, frequency_max = 0, 0.3
 
-# %% CHAOS SV POWER SPECTRUM AT THE CMB
+# CHAOS SV POWER SPECTRUM AT THE CMB
 
 chaos_file = Path(CHAOS_DIR) / "CHAOS-8.6.mat"
 chaos_model = cp.load_CHAOS_matfile(str(chaos_file))
@@ -84,13 +84,14 @@ chaos_mean_power = Mean_Instantaneous_Total_Lowes_Power(
     r=r_choice,
 )
 
-# %% STRICT FULL-SPECTRUM WATER-LEVEL SCALING
+# STRICT FULL-SPECTRUM WATER-LEVEL SCALING
 
 mode_periods = []
 water_level_power_scales = []
 scaled_mode_mean_powers = []
 scaled_mode_series = []
 scaled_mode_spectra = []
+scalings_dict = {}
 
 file_path = Path(FELIX_DIR) / "R_splines_arbitrary.h5"
 
@@ -130,10 +131,14 @@ with h5py.File(file_path, "r") as h5_file:
             & (mode_spectrum > 0)
         )
 
+        # cropping spectrum match zone
+        f_mask = chaos_f < 0.33
+
         power_scale = np.min(
-            chaos_spectrum[valid]
-            / mode_spectrum[valid]
+            chaos_spectrum[:, f_mask]
+            / mode_spectrum[:, f_mask]
         )
+
 
         scaled_series = (
             gnm_mode_good
@@ -154,6 +159,8 @@ with h5py.File(file_path, "r") as h5_file:
             mode_spectrum * power_scale
         )
 
+        scalings_dict[str(mode_number)] = np.sqrt(power_scale)
+
 mode_periods = np.asarray(mode_periods)
 water_level_power_scales = np.asarray(water_level_power_scales)
 scaled_mode_mean_powers = np.asarray(scaled_mode_mean_powers)
@@ -164,7 +171,18 @@ water_level_scale_by_mode = dict(
     zip(mode_numbers, water_level_power_scales)
 )
 
-# %% SCALED MODE POWER AGAINST PROVIDED PERIOD
+# %% saving with pickle
+import pickle
+from pathlib import Path
+
+scale_file = Path(FELIX_DIR) / "mode_amplitude_scalings_v1.pkl"
+
+with open(scale_file, "wb") as file:
+    pickle.dump(scalings_dict, file)
+
+# %%
+
+#  SCALED MODE POWER AGAINST PROVIDED PERIOD
 
 period_order = np.argsort(mode_periods)
 
@@ -208,7 +226,7 @@ with plt.rc_context({"font.size": 12}):
 
     plt.show()
 
-# %% OPTIMISATION PATCH: n = 1--8, 0 < f < 0.2 yr^-1
+# OPTIMISATION PATCH: n = 1--8, 0 < f < 0.2 yr^-1
 
 degree_fit_mask = (
     (chaos_degrees >= degree_min)
@@ -216,9 +234,12 @@ degree_fit_mask = (
 )
 
 frequency_fit_mask = (
-    (chaos_f > frequency_min)
+    (chaos_f >= frequency_min)
     & (chaos_f < frequency_max)
 )
+
+# getting rid of first bin
+frequency_fit_mask[1] = True
 
 chaos_patch = chaos_spectrum[
     np.ix_(degree_fit_mask, frequency_fit_mask)
@@ -253,7 +274,7 @@ def rms_log_misfit(candidate_patch):
     return np.sqrt(np.mean(error**2))
 
 
-# %% GREEDY LINEAR-SPECTRUM INITIAL SET
+# GREEDY LINEAR-SPECTRUM INITIAL SET
 
 initial_indices = []
 remaining_indices = list(range(len(mode_numbers)))
@@ -276,7 +297,7 @@ for _ in range(n_selected_modes):
 
 initial_set = set(initial_indices)
 
-# %% TRUE COHERENT POWER-SPECTRUM OBJECTIVE
+# TRUE COHERENT POWER-SPECTRUM OBJECTIVE
 
 loss_cache = {}
 
@@ -320,7 +341,7 @@ initial_loss = evaluate_mode_set(
     initial_gnm,
 )
 
-# %% SIMULATED ANNEALING USING THE TRUE COHERENT SPECTRUM
+# SIMULATED ANNEALING USING THE TRUE COHERENT SPECTRUM
 
 rng = np.random.default_rng(random_seed)
 all_indices = np.arange(len(mode_numbers))
@@ -416,7 +437,7 @@ for restart in range(n_restarts):
         f"best RMS log error = {best_loss:.4f}"
     )
 
-# %% DETERMINISTIC ONE-FOR-ONE SWAP REFINEMENT
+# DETERMINISTIC ONE-FOR-ONE SWAP REFINEMENT
 
 for swap_pass in range(max_swap_passes):
 
@@ -589,7 +610,7 @@ extent = [
     degree_patch[0] - 0.5,
     degree_patch[-1] + 0.5,
 ]
-# %%
+# 
 with plt.rc_context({"font.size": 12}):
 
     fig, axes = plt.subplots(
@@ -694,4 +715,310 @@ with plt.rc_context({"font.size": 12}):
     )
 
     plt.show()
-# %%
+
+
+# %% reconstruct optimal wave prediction over whole spectrum vs chaos
+from matplotlib.colors import LogNorm, ListedColormap, BoundaryNorm
+from matplotlib.patches import Rectangle
+
+# -----------------------------------------------------
+# EXTRACT FULL DISPLAY REGION
+# -----------------------------------------------------
+
+degree_plot_mask = (
+    (chaos_degrees >= 1)
+    & (chaos_degrees <= 20)
+)
+
+frequency_plot_mask = (
+    (chaos_f > 0)
+    & (chaos_f < 0.5)
+)
+
+degree_plot = chaos_degrees[degree_plot_mask]
+frequency_plot = chaos_f[frequency_plot_mask]
+
+# Assumes chaos_spectrum and optimal_spectrum both have shape:
+# (n_degrees, n_frequencies)
+chaos_plot = chaos_spectrum[
+    np.ix_(degree_plot_mask, frequency_plot_mask)
+]
+
+optimal_plot = optimal_spectrum[
+    np.ix_(degree_plot_mask, frequency_plot_mask)
+]
+
+# Cells valid for PSD comparison.
+plot_valid = (
+    np.isfinite(chaos_plot)
+    & np.isfinite(optimal_plot)
+    & (chaos_plot > 0)
+    & (optimal_plot > 0)
+)
+
+chaos_plot_masked = np.ma.masked_where(
+    ~plot_valid,
+    chaos_plot,
+)
+
+optimal_plot_masked = np.ma.masked_where(
+    ~plot_valid,
+    optimal_plot,
+)
+
+# Positive means wave PSD exceeds CHAOS.
+optimal_log_error_full = np.full_like(
+    chaos_plot,
+    np.nan,
+    dtype=float,
+)
+
+optimal_log_error_full[plot_valid] = np.log10(
+    optimal_plot[plot_valid]
+    / chaos_plot[plot_valid]
+)
+
+# -----------------------------------------------------
+# SHARED PSD COLOUR NORMALISATION
+# -----------------------------------------------------
+
+positive_power = np.concatenate([
+    chaos_plot_masked.compressed(),
+    optimal_plot_masked.compressed(),
+])
+
+power_norm = LogNorm(
+    vmin=np.min(positive_power),
+    vmax=np.max(positive_power),
+)
+
+power_cmap = plt.get_cmap("viridis").copy()
+power_cmap.set_bad("lightgrey")
+
+# -----------------------------------------------------
+# DISCRETE LOG-ERROR COLOUR SCALE
+# -----------------------------------------------------
+
+factor_2 = np.log10(2)
+factor_3 = np.log10(3)
+
+max_error = np.nanmax(
+    np.abs(optimal_log_error_full)
+)
+
+error_cap = max(
+    1.01,
+    max_error + 1e-6,
+)
+
+error_bounds = [
+    -error_cap,
+    -1,
+    -factor_3,
+    -factor_2,
+    factor_2,
+    factor_3,
+    1,
+    error_cap,
+]
+
+error_colors = [
+    "#08306B",  # underprediction by >10
+    "#2171B5",  # underprediction by 3–10
+    "#9ECAE1",  # underprediction by 2–3
+    "#FFFFFF",  # within factor 2
+    "#FCAE91",  # overprediction by 2–3
+    "#FB6A4A",  # overprediction by 3–10
+    "#CB181D",  # overprediction by >10
+]
+
+error_cmap = ListedColormap(error_colors)
+error_cmap.set_bad("lightgrey")
+
+error_norm = BoundaryNorm(
+    error_bounds,
+    error_cmap.N,
+    clip=True,
+)
+
+# -----------------------------------------------------
+# IMAGE EXTENT
+# -----------------------------------------------------
+
+df = np.mean(np.diff(frequency_plot))
+
+extent = [
+    frequency_plot[0] - df / 2,
+    frequency_plot[-1] + df / 2,
+    degree_plot[0] - 0.5,
+    degree_plot[-1] + 0.5,
+]
+
+# -----------------------------------------------------
+# FIT-REGION RECTANGLE
+# -----------------------------------------------------
+
+fit_degrees = chaos_degrees[degree_fit_mask]
+fit_frequencies = chaos_f[frequency_fit_mask]
+
+fit_frequencies = fit_frequencies[
+    (fit_frequencies > 0)
+    & (fit_frequencies < 0.5)
+]
+
+show_fit_rectangle = (
+    fit_degrees.size > 0
+    and fit_frequencies.size > 0
+)
+
+if show_fit_rectangle:
+    fit_df = np.mean(np.diff(chaos_f))
+
+    fit_x0 = fit_frequencies[0] - fit_df / 2
+    fit_x1 = fit_frequencies[-1] + fit_df / 2
+
+    fit_y0 = fit_degrees[0] - 0.5
+    fit_y1 = fit_degrees[-1] + 0.5
+
+# -----------------------------------------------------
+# PLOT
+# -----------------------------------------------------
+
+with plt.rc_context({"font.size": 12}):
+
+    fig, axes = plt.subplots(
+        1,
+        3,
+        figsize=(text_width, 4.8),
+        sharex=True,
+        sharey=True,
+        constrained_layout=True,
+    )
+
+    chaos_im = axes[0].imshow(
+        chaos_plot_masked,
+        origin="lower",
+        aspect="auto",
+        interpolation="nearest",
+        extent=extent,
+        cmap=power_cmap,
+        norm=power_norm,
+    )
+
+    axes[1].imshow(
+        optimal_plot_masked,
+        origin="lower",
+        aspect="auto",
+        interpolation="nearest",
+        extent=extent,
+        cmap=power_cmap,
+        norm=power_norm,
+    )
+
+    error_im = axes[2].imshow(
+        np.ma.masked_invalid(optimal_log_error_full),
+        origin="lower",
+        aspect="auto",
+        interpolation="nearest",
+        extent=extent,
+        cmap=error_cmap,
+        norm=error_norm,
+    )
+
+    axes[0].set_title("CHAOS-8.6")
+    axes[1].set_title(
+        "Optimal mode\ncombination"
+    )
+    axes[2].set_title(
+        r"$\log_{10}(P_{\mathrm{wave}}/"
+        r"P_{\mathrm{CHAOS}})$"
+    )
+
+    # Add the optimisation-region box to every panel.
+    if show_fit_rectangle:
+        for ax in axes:
+            rectangle = Rectangle(
+                (fit_x0, fit_y0),
+                fit_x1 - fit_x0,
+                fit_y1 - fit_y0,
+                fill=False,
+                edgecolor="black",
+                linewidth=1.5,
+                linestyle=":",
+                label="Fit region",
+            )
+            ax.add_patch(rectangle)
+
+    for ax in axes:
+        ax.set_xlabel(
+            r"Frequency / $\mathrm{yr}^{-1}$"
+        )
+        ax.set_xlim(
+            frequency_plot[0] - df / 2,
+            frequency_plot[-1] + df / 2,
+        )
+        ax.set_ylim(0.5, 20.5)
+        ax.set_yticks(
+            np.arange(2, 21, 2)
+        )
+
+    axes[0].set_ylabel(
+        r"Spherical harmonic degree $n$"
+    )
+
+    if show_fit_rectangle:
+        axes[2].legend(
+            loc="upper right",
+            frameon=True,
+        )
+
+    power_cbar = fig.colorbar(
+        chaos_im,
+        ax=axes[:2],
+        location="bottom",
+        fraction=0.08,
+        pad=0.13,
+    )
+
+    power_cbar.set_label(
+        r"Lowes SV power spectral density at the CMB "
+        r"/ $(\mathrm{nT\,yr^{-1}})^2"
+        r"\,\mathrm{yr}$"
+    )
+
+    error_cbar = fig.colorbar(
+        error_im,
+        ax=axes[2],
+        boundaries=error_bounds,
+        ticks=[
+            -1,
+            -factor_3,
+            -factor_2,
+            factor_2,
+            factor_3,
+            1,
+        ],
+    )
+
+    error_cbar.set_ticklabels([
+        r"$-1$",
+        r"$-\log_{10}(3)$",
+        r"$-\log_{10}(2)$",
+        r"$\log_{10}(2)$",
+        r"$\log_{10}(3)$",
+        r"$1$",
+    ])
+
+    error_cbar.set_label(
+        r"$\log_{10}(P_{\mathrm{wave}}/"
+        r"P_{\mathrm{CHAOS}})$"
+    )
+
+    fig.savefig(
+        f"{FIG_DIR}/final/"
+        "optimal_wave_chaos_power_spectrum_full.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+
+    plt.show()
