@@ -3,6 +3,7 @@ __pycache__/
 data/
 results/
 figures/
+outputs/
 
 # VS Code local settings
 .vscode/
@@ -25,6 +26,7 @@ __pycache__/
 *.npz
 *.mat
 *.nc
+*.pkl
 
 # Videos / animations
 *.mp4

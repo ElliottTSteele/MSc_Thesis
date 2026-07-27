@@ -1,25 +1,9 @@
-'''
-Plan:
-
-this presents the base case with exact dmd + uncertainty ensemble
-'''
-
-# PREAMBLE
-# %% SETTING UP AUTOUPDATES
-
-from IPython import get_ipython
-
-ipython = get_ipython()
-if ipython is not None:
-    ipython.run_line_magic("load_ext", "autoreload")
-    ipython.run_line_magic("autoreload", "2")
-
 # %% FILE SYSTEM AND DEPENDENCY SETUP
 
 import sys
 from pathlib import Path
 print(sys.path)
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
@@ -78,8 +62,15 @@ import numpy as np
 mode_numbers = [ 1, 6, 13, 21, 32, 45, 53, 60]
 mode_numbers = [str(num) for num in mode_numbers]
 
-# if including perturbation ensemble
-ensemble_flag = True #
+# if including covariance-based perturbation ensemble
+ensemble_flag = True
+n_realisations = 10
+
+# Temporal correlation model passed to Perturbation_Generate.
+# This function is assumed to use the CHAOS covariance matrices already
+# available through the synthetic setup utilities.
+noise_temporal_model = "independent"
+noise_tau_years = 1.5
 
 # if windowing to 'high quality' record
 high_q_flag = True
@@ -165,8 +156,8 @@ if all_at_once:
         if ensemble_flag:
             # noised ~ (nrealisations, Nt, Ng)
             noised = Perturbation_Generate(gnm_total_res, 
-                                                n_realisations=10,
-                                                temporal_z="independent",
+                                                n_realisations=n_realisations,
+                                                temporal_z="ar1",
                                                 tau=1.5,
                                                 dt=dt_years)
             
@@ -189,6 +180,7 @@ if all_at_once:
                 DMD_recovery[mode_number]["DMD_noised"][truncation_degree] = {
                     "similarity": [],
                     "eigenvalue": [],
+                    "recovered_period": [],
                 }
 
         for truncation_degree in degree_truncations_tested:
@@ -292,9 +284,10 @@ if all_at_once:
                     if match_made and result == "no_noise":
 
                         DMD_recovery[mode_number]["DMD"][truncation_degree] = {
-                                "similarity": similarity_high_score,
-                                "eigenvalue": candidate_eigs[match_idx],
-                            }
+                            "similarity": similarity_high_score,
+                            "eigenvalue": candidate_eigs[match_idx],
+                            "recovered_period": candidate_periods[match_idx],
+                        }
 
                     elif match_made and result == "noised":
 
@@ -305,6 +298,10 @@ if all_at_once:
                         DMD_recovery[mode_number]["DMD_noised"][truncation_degree][
                             "eigenvalue"
                         ].append(candidate_eigs[match_idx])
+
+                        DMD_recovery[mode_number]["DMD_noised"][truncation_degree][
+                            "recovered_period"
+                        ].append(candidate_periods[match_idx])
 else:
     # ------------------------------------------------------
     # OBTAIN INPUT DATA AND RUN EACH MODE INDEPENDENTLY
@@ -356,6 +353,7 @@ else:
                 ] = {
                     "similarity": [],
                     "eigenvalue": [],
+                    "recovered_period": [],
                 }
 
             # -------------------------------------------------
@@ -437,9 +435,9 @@ else:
 
                 noised = Perturbation_Generate(
                     gnm_mode_res,
-                    n_realisations=10,
-                    temporal_z="independent",
-                    tau=1.5,
+                    n_realisations=n_realisations,
+                    temporal_z=noise_temporal_model,
+                    tau=noise_tau_years,
                     dt=dt_years,
                 )
 
@@ -723,6 +721,16 @@ else:
                             ]
                         )
 
+                        DMD_recovery[
+                            mode_number
+                        ]["DMD_noised"][
+                            truncation_degree
+                        ]["recovered_period"].append(
+                            candidate_periods[
+                                match_idx
+                            ]
+                        )
+
 
     print(
         f"Completed independent DMD tests "
@@ -731,28 +739,32 @@ else:
 #
 
 # %% ------------------------------------------------------
-# PLOT DMD RECOVERY AS FUNCTION OF DEGREE TRUNCATION
+# PLOT DMD RECOVERY AS FUNCTION OF DEGREE BAND
 # ---------------------------------------------------------
 
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import cm
 from matplotlib.colors import BoundaryNorm
+from matplotlib.lines import Line2D
 
-# Ensure sorted integer truncation degrees
-degrees = np.asarray(sorted(degree_truncations_tested), dtype=int)
+degrees = np.asarray(
+    sorted(degree_truncations_tested),
+    dtype=int,
+)
 
 # ---------------------------------------------------------
 # DISCRETE VIRIDIS COLOUR MAPPING
 # ---------------------------------------------------------
 
-# One distinct colour for each tested truncation degree
-cmap = plt.colormaps["viridis"].resampled(len(degrees))
+cmap = plt.colormaps["viridis"].resampled(
+    len(degrees)
+)
 
-# Boundaries centred between degree values, giving a genuinely discrete
-# colourbar rather than implying a continuous variable.
 if len(degrees) > 1:
-    degree_step = np.median(np.diff(degrees))
+    degree_step = np.median(
+        np.diff(degrees)
+    )
 else:
     degree_step = 1
 
@@ -762,62 +774,245 @@ boundaries = np.concatenate([
     [degrees[-1] + degree_step / 2],
 ])
 
-norm = BoundaryNorm(boundaries, cmap.N)
+norm = BoundaryNorm(
+    boundaries,
+    cmap.N,
+)
+
+
+# ---------------------------------------------------------
+# DEGREE-DEPENDENT DRAWING WEIGHTS
+#
+# Lowest-degree bands are plotted first and most prominently.
+# Higher-degree bands are drawn later (on top), but with
+# progressively thinner uncertainty lines and smaller symbols.
+# ---------------------------------------------------------
+
+degree_rank = {
+    degree: rank
+    for rank, degree in enumerate(degrees)
+}
+
+n_degree_levels = max(len(degrees) - 1, 1)
+
+
+def degree_style(degree):
+    """Return linewidth/marker sizes that decrease with degree."""
+    fraction = degree_rank[degree] / n_degree_levels
+
+    return {
+        "interval_lw": 3.0 - 1.8 * fraction,
+        "median_size": 70.0 - 38.0 * fraction,
+        "cross_size": 85.0 - 45.0 * fraction,
+        "cross_lw": 2.2 - 0.8 * fraction,
+        "outline_lw": 4.2 - 1.4 * fraction,
+    }
+
+
+def finite_quantiles(values, quantiles=(0.05, 0.5, 0.95)):
+    """
+    Return requested quantiles after dropping non-finite values.
+
+    Returns None if no finite ensemble members remain.
+    """
+    values = np.asarray(
+        values,
+        dtype=float,
+    )
+
+    values = values[
+        np.isfinite(values)
+    ]
+
+    if values.size == 0:
+        return None
+
+    return np.quantile(
+        values,
+        quantiles,
+    )
 
 
 # =========================================================
-# FIGURE 1: SIMILARITY VS TRUE PERIOD
+# FIGURE 1: SPATIAL SIMILARITY VS TRUE PERIOD
+#
+# Drawing order:
+#   1. Lowest degree first, highest degree last
+#   2. p05-p95 interval
+#   3. ensemble median square
+#   4. exact/no-perturbation cross on top
+#
+# Degree styling:
+#   lower degree = thicker interval + larger symbols
+#   higher degree = thinner interval + smaller symbols
 # =========================================================
 
-fig, ax = plt.subplots(figsize=(7.5, 5.5))
+fig, ax = plt.subplots(
+    figsize=(7.5, 5.5)
+)
 
 for degree in degrees:
 
-    true_periods = []
-    similarities = []
+    colour = cmap(
+        norm(degree)
+    )
+
+    style = degree_style(
+        degree
+    )
 
     for mode_number, results in DMD_recovery.items():
 
-        # Skip missing results
-        if (
-            not results.get("DMD")
-            or degree not in results["DMD"]
-        ):
-            continue
+        true_period = results[
+            "true_period"
+        ]
 
-        true_period = results["true_period"]
-        similarity = results["DMD"][degree]["similarity"]
+        # ---------------------------------------------
+        # COVARIANCE-PERTURBED ENSEMBLE FIRST
+        # ---------------------------------------------
+        noised_result = results.get(
+            "DMD_noised",
+            {},
+        ).get(
+            degree,
+            {},
+        )
 
-        true_periods.append(true_period)
-        similarities.append(similarity)
+        similarity_q = finite_quantiles(
+            noised_result.get(
+                "similarity",
+                [],
+            )
+        )
 
-    if len(true_periods) == 0:
-        continue
+        if similarity_q is not None:
 
-    true_periods = np.asarray(true_periods)
-    similarities = np.asarray(similarities)
+            p05, median, p95 = similarity_q
 
-    # Sort from HIGH period to LOW period before joining
-    sort_idx = np.argsort(true_periods)[::-1]
+            ax.vlines(
+                true_period,
+                p05,
+                p95,
+                color=colour,
+                linewidth=style["interval_lw"],
+                alpha=0.85,
+                zorder=1 + degree_rank[degree],
+            )
 
-    ax.plot(
-        true_periods[sort_idx],
-        similarities[sort_idx],
-        marker="o",
+            ax.scatter(
+                true_period,
+                median,
+                marker="s",
+                s=style["median_size"],
+                color=colour,
+                edgecolors="black",
+                linewidths=0.35,
+                zorder=20 + degree_rank[degree],
+            )
+
+        # ---------------------------------------------
+        # EXACT / NO-PERTURBATION RESULT ON TOP
+        # ---------------------------------------------
+        exact_result = results.get(
+            "DMD",
+            {},
+        ).get(
+            degree,
+            None,
+        )
+
+        if exact_result is not None:
+
+            exact_similarity = exact_result[
+                "similarity"
+            ]
+
+            if np.isfinite(
+                exact_similarity
+            ):
+
+                # White under-stroke gives the cross a visible outline
+                # against either the median square or another degree colour.
+                ax.scatter(
+                    true_period,
+                    exact_similarity,
+                    marker="x",
+                    s=style["cross_size"],
+                    linewidths=style["outline_lw"],
+                    color="white",
+                    zorder=40 + degree_rank[degree],
+                )
+
+                ax.scatter(
+                    true_period,
+                    exact_similarity,
+                    marker="x",
+                    s=style["cross_size"],
+                    linewidths=style["cross_lw"],
+                    color=colour,
+                    zorder=41 + degree_rank[degree],
+                )
+
+
+ax.set_xlabel(
+    "True period (years)"
+)
+
+ax.set_ylabel(
+    "Spatial similarity"
+)
+
+ax.set_ylim(
+    0,
+    1.05,
+)
+
+ax.grid(
+    alpha=0.25
+)
+
+marker_handles = [
+    Line2D(
+        [0],
+        [0],
+        marker="x",
+        linestyle="None",
+        markeredgecolor="black",
+        markeredgewidth=2.0,
+        color="white",
+        markersize=8,
+        label="No perturbation",
+    ),
+    Line2D(
+        [0],
+        [0],
+        marker="s",
+        linestyle="None",
+        markerfacecolor="black",
+        markeredgecolor="black",
+        markersize=6,
+        label="Perturbed median",
+    ),
+    Line2D(
+        [0],
+        [0],
         linestyle="-",
-        linewidth=1.2,
-        markersize=5,
-        color=cmap(norm(degree)),
-    )
+        color="black",
+        linewidth=2.0,
+        label="Perturbed p05-p95",
+    ),
+]
 
-ax.set_xlabel("True period (years)")
-ax.set_ylabel("Spatial similarity")
-ax.set_ylim(0, 1.05)
+ax.legend(
+    handles=marker_handles,
+    loc="best",
+)
 
-ax.grid(alpha=0.25)
+sm = cm.ScalarMappable(
+    cmap=cmap,
+    norm=norm,
+)
 
-# Discrete colourbar
-sm = cm.ScalarMappable(cmap=cmap, norm=norm)
 sm.set_array([])
 
 cbar = fig.colorbar(
@@ -828,7 +1023,9 @@ cbar = fig.colorbar(
     spacing="uniform",
 )
 
-cbar.set_label("Spherical harmonic truncation degree")
+cbar.set_label(
+    "Upper spherical harmonic degree of 4-degree band"
+)
 
 fig.tight_layout()
 plt.show()
@@ -836,63 +1033,182 @@ plt.show()
 
 # =========================================================
 # FIGURE 2: SIGNED PERIOD ERROR VS TRUE PERIOD
+#
+# Same layering convention as Figure 1.
 # =========================================================
 
-fig, ax = plt.subplots(figsize=(7.5, 5.5))
+fig, ax = plt.subplots(
+    figsize=(7.5, 5.5)
+)
 
 for degree in degrees:
 
-    true_periods = []
-    period_errors = []
+    colour = cmap(
+        norm(degree)
+    )
+
+    style = degree_style(
+        degree
+    )
 
     for mode_number, results in DMD_recovery.items():
 
-        # Skip missing results
-        if (
-            not results.get("DMD")
-            or degree not in results["DMD"]
-        ):
-            continue
+        true_period = results[
+            "true_period"
+        ]
 
-        true_period = results["true_period"]
+        # ---------------------------------------------
+        # COVARIANCE-PERTURBED ENSEMBLE FIRST
+        # ---------------------------------------------
+        noised_result = results.get(
+            "DMD_noised",
+            {},
+        ).get(
+            degree,
+            {},
+        )
 
-        eig = results["DMD"][degree]["eigenvalue"]
+        recovered_periods = np.asarray(
+            noised_result.get(
+                "recovered_period",
+                [],
+            ),
+            dtype=float,
+        )
 
-        # DMD recovered period
-        recovered_period = 2 * np.pi / np.abs(eig.imag)
+        if recovered_periods.size == 0:
 
-        # SIGNED percentage error:
-        # positive = recovered period too long
-        # negative = recovered period too short
-        period_error_pct = (
+            noised_eigs = noised_result.get(
+                "eigenvalue",
+                [],
+            )
+
+            recovered_periods = np.asarray([
+                (
+                    2 * np.pi
+                    / np.abs(eig.imag)
+                )
+                if np.abs(eig.imag) > 0
+                else np.nan
+                for eig in noised_eigs
+            ])
+
+        period_errors = (
             100
-            * (recovered_period - true_period)
+            * (
+                recovered_periods
+                - true_period
+            )
             / true_period
         )
 
-        true_periods.append(true_period)
-        period_errors.append(period_error_pct)
+        period_q = finite_quantiles(
+            period_errors
+        )
 
-    if len(true_periods) == 0:
-        continue
+        if period_q is not None:
 
-    true_periods = np.asarray(true_periods)
-    period_errors = np.asarray(period_errors)
+            p05, median, p95 = period_q
 
-    # Sort from HIGH period to LOW period before joining
-    sort_idx = np.argsort(true_periods)[::-1]
+            ax.vlines(
+                true_period,
+                p05,
+                p95,
+                color=colour,
+                linewidth=style["interval_lw"],
+                alpha=0.85,
+                zorder=1 + degree_rank[degree],
+            )
 
-    ax.plot(
-        true_periods[sort_idx],
-        period_errors[sort_idx],
-        marker="o",
-        linestyle="-",
-        linewidth=1.2,
-        markersize=5,
-        color=cmap(norm(degree)),
-    )
+            ax.scatter(
+                true_period,
+                median,
+                marker="s",
+                s=style["median_size"],
+                color=colour,
+                edgecolors="black",
+                linewidths=0.35,
+                zorder=20 + degree_rank[degree],
+            )
 
-# Zero-error reference
+        # ---------------------------------------------
+        # EXACT / NO-PERTURBATION RESULT ON TOP
+        # ---------------------------------------------
+        exact_result = results.get(
+            "DMD",
+            {},
+        ).get(
+            degree,
+            None,
+        )
+
+        if exact_result is not None:
+
+            if (
+                "recovered_period"
+                in exact_result
+            ):
+
+                recovered_period = exact_result[
+                    "recovered_period"
+                ]
+
+            else:
+
+                eig = exact_result[
+                    "eigenvalue"
+                ]
+
+                if np.abs(
+                    eig.imag
+                ) > 0:
+
+                    recovered_period = (
+                        2
+                        * np.pi
+                        / np.abs(
+                            eig.imag
+                        )
+                    )
+
+                else:
+
+                    recovered_period = np.nan
+
+            if np.isfinite(
+                recovered_period
+            ):
+
+                exact_period_error = (
+                    100
+                    * (
+                        recovered_period
+                        - true_period
+                    )
+                    / true_period
+                )
+
+                ax.scatter(
+                    true_period,
+                    exact_period_error,
+                    marker="x",
+                    s=style["cross_size"],
+                    linewidths=style["outline_lw"],
+                    color="white",
+                    zorder=40 + degree_rank[degree],
+                )
+
+                ax.scatter(
+                    true_period,
+                    exact_period_error,
+                    marker="x",
+                    s=style["cross_size"],
+                    linewidths=style["cross_lw"],
+                    color=colour,
+                    zorder=41 + degree_rank[degree],
+                )
+
+
 ax.axhline(
     0,
     color="black",
@@ -900,13 +1216,30 @@ ax.axhline(
     linewidth=1,
 )
 
-ax.set_xlabel("True period (years)")
-ax.set_ylabel("Recovered period error (%)")
+ax.set_xlabel(
+    "True period (years)"
+)
 
-ax.grid(alpha=0.25)
+ax.set_ylabel(
+    "Recovered period error (%)"
+)
 
-# Discrete colourbar
-sm = cm.ScalarMappable(cmap=cmap, norm=norm)
+ax.set_ylim(-100, 100)
+
+ax.grid(
+    alpha=0.25
+)
+
+ax.legend(
+    handles=marker_handles,
+    loc="best",
+)
+
+sm = cm.ScalarMappable(
+    cmap=cmap,
+    norm=norm,
+)
+
 sm.set_array([])
 
 cbar = fig.colorbar(
@@ -917,8 +1250,65 @@ cbar = fig.colorbar(
     spacing="uniform",
 )
 
-cbar.set_label("Spherical harmonic truncation degree")
+cbar.set_label(
+    "Upper spherical harmonic degree of 4-degree band"
+)
 
 fig.tight_layout()
 plt.show()
 
+
+# =========================================================
+# OPTIONAL NUMERICAL ENSEMBLE SUMMARY
+# =========================================================
+
+print(
+    "\nCovariance-perturbation ensemble summary"
+)
+
+print(
+    f"Requested realisations: {n_realisations}"
+)
+
+for degree in degrees:
+
+    n_similarity_matches = 0
+    n_period_matches = 0
+
+    for results in DMD_recovery.values():
+
+        noised_result = results.get(
+            "DMD_noised",
+            {},
+        ).get(
+            degree,
+            {},
+        )
+
+        n_similarity_matches += len(
+            noised_result.get(
+                "similarity",
+                [],
+            )
+        )
+
+        n_period_matches += np.sum(
+            np.isfinite(
+                np.asarray(
+                    noised_result.get(
+                        "recovered_period",
+                        [],
+                    ),
+                    dtype=float,
+                )
+            )
+        )
+
+    print(
+        f"Degree band "
+        f"{max(1, degree - 3)}-{degree}: "
+        f"{n_similarity_matches} matched similarity results, "
+        f"{n_period_matches} finite period results"
+    )
+
+# %%
