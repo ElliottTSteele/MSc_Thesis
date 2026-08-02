@@ -48,16 +48,26 @@ def R_Read_In(R_part, which):
 # reading in the 'cheap' matrices P and H (over all components)
 derivative_keys = ["MF", "SV", "SA"]
 
-P = R_Read_In("P", "MF")
-H_mf = R_Read_In("H", "MF")
-H_sv = R_Read_In("H", "SV")
-H_sa = R_Read_In("H", "SA")
+# reading in the (smaller) covariance file information provided
 
-H_dict = {
-    "MF":H_mf,
-    "SV":H_sv,
-    "SA":H_sa
-}
+file_path = Path(f"{CHAOS_COV_DIR}/CHAOS_Cov_1997_2026_0806_BSpl.h5")
+
+with h5py.File(file_path, "r") as cov_file:
+
+    knots = np.asarray(cov_file["knots"])
+    n_spl =  np.asarray(cov_file["n_spl"])
+    n_m =  np.asarray(cov_file["n_m"])
+    nmax =  np.asarray(cov_file["nmax"])
+    order =  np.asarray(cov_file["order"])
+
+
+    print(f"There are {len(knots)} knots")
+    print(f"There are: {n_spl} splines")
+    print(f"There are: {nmax} degrees")
+
+P = R_Read_In("P", "MF")
+
+H_sv = 365.25 * cp.model_utils.colloc_matrix(x=times_used_mjd, knots=knots, order=order, deriv = 1)
 
 # applies R in 2 halves, fine for RAM
 def R_Apply_Two_Halves(gnm_spl, verbose=True):
@@ -123,24 +133,15 @@ def n_Gauss_Coeffs(lmax):
 
     return lmax * (lmax + 2)
 
-
-def Truncate_Gauss_Coeffs(gauss_data, tmax, tmin=1):
+# truncates any data with shape (Nx, Ngauss), with 
+def Truncate_Gauss_Coeffs(gauss_data, tmax):
 
     gauss_data = np.asarray(gauss_data)
-
-    # Start of degree tmin in a vector beginning at n=1
-    start_index = tmin**2 - 1
 
     # Exclusive endpoint immediately after degree tmax
     stop_index = (tmax + 1)**2 - 1
 
-    if gauss_data.shape[-1] < stop_index:
-        raise ValueError(
-            f"Input only has {gauss_data.shape[-1]} coefficients, "
-            f"but tmax={tmax} requires at least {stop_index}."
-        )
-
-    return gauss_data[..., start_index:stop_index]
+    return gauss_data[..., :stop_index]
 
 
 # infer maximum spherical harmonic degree from number of coefficients
@@ -264,7 +265,7 @@ def Mean_Instantaneous_Total_Lowes_Power(
 def Gauss_Coeff_PSD(
     gauss_coeff_series,
     fs,
-    detrend="linear",
+    detrend=None,
     window="hann",
     scaling="spectrum",
 ):
@@ -290,9 +291,9 @@ def Lowes_Degree_PSD(
     fs,
     a=r_earth,
     r=r_cmb,
-    detrend="linear",
+    detrend=None,
     window="hann",
-    scaling="density",
+    scaling="spectrum",
 ):
 
     gauss_data = np.asarray(gauss_data)
@@ -320,8 +321,10 @@ def Lowes_Degree_PSD(
 
     return frequencies, degree_psd
 
-degrees = np.arange(1, 21)
-def Lowes_Degree_PSD_All_Degrees(gnm, a, r, f_sample=1/dt_years, degrees=degrees):
+
+def Lowes_Degree_PSD_All_Degrees(gnm, a, r, f_sample, nmax):
+
+    degrees = np.arange(1, nmax+1, 1)
 
     degree_psds = []
 
@@ -336,7 +339,7 @@ def Lowes_Degree_PSD_All_Degrees(gnm, a, r, f_sample=1/dt_years, degrees=degrees
             fs=f_sample,
             a=a,
             r=r,
-            detrend="constant",
+            detrend=None,
             window="hann",
             scaling="spectrum",
         )
@@ -363,20 +366,35 @@ phi_v = np.rad2deg(phi_grid.copy().ravel())
 radius_v = np.full(len(phi_v), r_cmb)
 
 # gauss -> physical forward operators
-# using nmax = 20
-A_r, A_t, A_p = cp.model_utils.design_gauss(
-    radius_v, theta_v, phi_v, nmax=20, source="internal"
+# using nmax = 15
+A_15_r, A_15_t, A_15_p = cp.model_utils.design_gauss(
+    radius_v, theta_v, phi_v, nmax=15, source="internal"
 )
 
-A_20_dict = {"r": A_r, "theta": A_t, "phi": A_p}
+A_15_dict = {"r": A_15_r, "theta": A_15_t, "phi": A_15_p}
 
+# ---------------------------------------------------------
+# LOADING CHAOS DATA 
+# ---------------------------------------------------------
+
+def CHAOS_Full_SV_Record_Obtain(model_version="CHAOS-8.6.mat", nmax=15):
+    # load the CHAOS model from the mat-file
+    model = cp.load_CHAOS_matfile(f'{CHAOS_DIR}/{model_version}')
+
+    # printing full unbounded extent of CHAOS8.6 model (decimal year)
+    print('Full CHAOS-8.6 timespan is:', cp.mjd_to_dyear(model.model_tdep.breaks[[0, -1]]))
+
+    # gauss coeffs in natural order, i.e. g(n,m): g(1,0), g(1, 1), h(1, 1), ...
+    gnm_chaos = model.synth_coeffs_tdep(times_used_mjd, nmax=nmax, deriv=1)  # shape: (10, 224)
+
+    return(gnm_chaos)
 
 # ---------------------------------------------------------
 # LOADING SYNTHETIC DATA
 # ---------------------------------------------------------
 
 # basic mode i loading code - assumes SV wanted
-def Component_Load_SV(mode_number, directory=FELIX_DIR):
+def Component_Load_SV(mode_number, directory=FELIX_DIR, nmax = 15):
     # select a mode number and corresponding file
     file = h5py.File(f'{directory}/mode_surface_including_gnm_{mode_number}.h5',"r")
 
@@ -386,8 +404,9 @@ def Component_Load_SV(mode_number, directory=FELIX_DIR):
     # load all components, transpose to lat, long
 
     # gauss coefficient (magnetic scalar potential) phasors
-    gnm = va_to_nt_arbitrary * (np.asarray(file["gnmr"]) +\
+    gnm_60 = va_to_nt_arbitrary * (np.asarray(file["gnmr"]) +\
          1j*np.asarray(file["gnmi"])) # [nT, arbitrary]
+    gnm = Truncate_Gauss_Coeffs(gnm_60, tmax=nmax)
 
     # Br
     br = va_to_nt_arbitrary * (np.asarray(file["brr"]).T +\
@@ -424,11 +443,11 @@ def Component_Load_SV(mode_number, directory=FELIX_DIR):
     return mode_i_info
 
 # function to create time series from gauss coefficient phasor
-def G_Time_Series_Eval(G_mode_i, eigenvalue):
+def G_Time_Series_Eval(G_mode_i, eigenvalue, times=times_evaluate_ideal_phasors):
 
     mode_i_contribution_list = []
     
-    for t in times_dyear:
+    for t in times:
         # computing at time t
         G_t_mode_i = np.real(np.exp(eigenvalue * t) * G_mode_i)
         G_t_mode_i = np.ravel(G_t_mode_i) # state vector
@@ -438,11 +457,162 @@ def G_Time_Series_Eval(G_mode_i, eigenvalue):
 
     return mode_i_contribution_array
 
+
+# define function - pulls out signals necessary + input mode info for comparison
+def Synthetic_Full_SV_Record_Obtain(mode_numbers, times=times_used_relative, scale_flag=True, nmax=15):
+    # for each mode - forming the ideal input record and withdrawing precomputed resolved record
+    spline_path = Path(FELIX_DIR) / "R_splines_arbitrary.h5"
+    synthetic_suite_info = {}
+    gnm_total_ideal_list = []
+    gnm_total_resolved_list = []
+
+    with h5py.File(spline_path, "r") as h5_file:
+        for mode_number in mode_numbers:
+
+            # getting amplitude scaler
+            if scale_flag:
+                amplitude_scaler = mode_amp_scalings[mode_number]
+            else:
+                amplitude_scaler = 1
+
+
+            # 1) getting ideal mode gauss coefficient time series
+            mode_data = Component_Load_SV(mode_number, nmax=nmax)
+            eigenvalue = mode_data["eigenvalue"]
+            ideal_gnm_phasor = amplitude_scaler * mode_data["gnm"]
+            true_period = 2.0 * np.pi / np.abs(eigenvalue.imag)
+            gnm_mode_ideal = G_Time_Series_Eval(
+                ideal_gnm_phasor,
+                eigenvalue,
+                # need to use the specific 'ideal times evaluate' to get correct phase
+            )
+
+            # 2) getting the resolved gauss coefficient time series
+            dataset_name = f"mode_{mode_number}/without_decay"
+            gnm_spline = np.asarray(h5_file[dataset_name][()])
+            gnm_mode_resolved = H_sv @ (
+                amplitude_scaler * gnm_spline
+            )
+            gnm_mode_resolved = Truncate_Gauss_Coeffs(gnm_mode_resolved, tmax=nmax)
+
+            # store it all for future reference
+            synthetic_suite_info[mode_number] = {
+                "true_period": float(true_period),
+                "true_eigenvalue": eigenvalue,
+                "gnm_phasor": ideal_gnm_phasor,
+                "gnm_ideal": gnm_mode_ideal,
+                "gnm_resolved": gnm_mode_resolved,
+            }
+            gnm_total_ideal_list.append(gnm_mode_ideal)
+            gnm_total_resolved_list.append(gnm_mode_resolved)
+
+    # stacking lists to get cumulative wave signals
+    gnm_total_ideal = np.sum(np.asarray(gnm_total_ideal_list), axis=0)
+    gnm_total_resolved = np.sum(
+        np.asarray(gnm_total_resolved_list),
+        axis=0,
+    )
+
+    # deleting deprecated objects
+    del gnm_total_ideal_list
+    del gnm_total_resolved_list
+
+    return(gnm_total_ideal, gnm_total_resolved, synthetic_suite_info)
+
+
+# ---------------------------------------------------------
+# CODE TO ACCOUNT FOR NON WAVE ORIGIN SPECTRUM
+# ---------------------------------------------------------
+
+from scipy.signal import firwin2, lfilter
+
+def Non_Wave_Spectral_Infill(gnm_chaos, gnm_syn, nmax=15, dt_sample=dt_sample, seed=42):
+
+    Nt, Ng = np.shape(gnm_chaos)
+
+    f_sample = 1/dt_sample
+
+
+    g_noise = np.zeros_like(gnm_chaos)
+
+    rng = np.random.default_rng(seed)
+
+    for g_idx in range(Ng):
+
+        g_series_chaos = gnm_chaos[:, g_idx]
+        g_series_mode = gnm_syn[:, g_idx]
+
+        g_f_c, g_p_c = periodogram(
+            g_series_chaos,
+            fs=f_sample,
+            detrend=None,
+            window="hann"
+        )
+
+        _, g_p_m = periodogram(
+            g_series_mode,
+            fs=f_sample,
+            detrend=None,
+            window="hann"
+        )
+
+        g_p_diff = np.maximum(g_p_c - g_p_m, 0)
+
+        frequencies = g_f_c.copy()
+
+        mask = (frequencies>1/2)
+        g_p_diff[mask] = 0
+
+
+        f_nyquist = f_sample / 2
+        
+        amp_gains = np.sqrt(g_p_diff * f_sample / 2)
+        amp_gains[0] = np.sqrt(g_p_diff[0] * f_sample)
+
+        if np.isclose(frequencies[-1], f_nyquist):
+            amp_gains[-1] = np.sqrt(g_p_diff[-1] * f_sample)
+
+
+        if frequencies[-1] < f_nyquist:
+            frequencies = np.append(frequencies, f_nyquist)
+            amp_gains = np.append(amp_gains, amp_gains[-1])
+
+        taps = firwin2(
+            numtaps=101,
+            freq=frequencies,
+            gain=amp_gains,
+            fs=f_sample,
+        )
+
+        burn_in = 3 * 101
+        white = rng.normal(size=Nt + burn_in)
+        noise = lfilter(taps, 1.0, white)[burn_in:]
+
+        g_noise[:, g_idx] = noise
+
+    # procedure produces amplified noise at low degree - scale by comparison
+
+    '''# compute lowes psd at each degree
+    for n in range(1, nmax, 1):
+        n_f, n_ps_chaos = Lowes_Degree_PSD(gnm_chaos, n=n, fs=f_sample)
+        _, n_ps_noise = Lowes_Degree_PSD(g_noise, n=n, fs=f_sample)
+
+        reliable_mask = (n_f < 1/3)
+        # sum to get total power in degree
+        tot_p_n_chaos = np.sum(n_ps_chaos[reliable_mask])
+        tot_p_n_noise = np.sum(n_ps_noise[reliable_mask])
+
+        n_factor = np.sqrt(tot_p_n_chaos/tot_p_n_noise)
+
+        n_slice = Gauss_Degree_Slice(n)
+
+        g_noise[:, n_slice] *= n_factor
+'''
+    return(g_noise)
+
 # ---------------------------------------------------------
 # GENERIC VISUALISATION CODE
 # ---------------------------------------------------------
-
-
 
 # converts a state vector series array ((ntheta*nphi), nt) into a cube (nt, ntheta, nphi)
 def Series_To_Cube(series, state_shape=state_shape):
@@ -450,7 +620,7 @@ def Series_To_Cube(series, state_shape=state_shape):
     return series.T.reshape((series.shape[1], *state_shape))
 
 # basic movie for data cube
-def Cube_Movie(series, name="data_cube", fig_dir=FIG_DIR, fps=5, cmap="seismic"):
+def Cube_Movie(series, name="data_cube", fig_dir=FIG_DIR, fps=5, cmap="seismic", set_vlim = False):
     """
     data_cube shape: (nt, nlat, nlon)
     """
@@ -465,6 +635,10 @@ def Cube_Movie(series, name="data_cube", fig_dir=FIG_DIR, fps=5, cmap="seismic")
 
     vmax = np.nanmax(np.abs(cube))
     vmin = -vmax
+
+    if set_vlim:
+        vmin = -set_vlim
+        vmax = set_vlim
 
     fig, ax = plt.subplots(figsize=(10, 5), dpi=150)
 

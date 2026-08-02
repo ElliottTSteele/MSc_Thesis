@@ -1,10 +1,17 @@
 """
-DMD generic template
+Flexible synthetic DMD recovery at two independently fitted degree truncations.
+
+The low and high recovery degrees are separate experiments: each constructs
+its own spatial projection, selects its own SVD rank, fits every requested DMD
+input, matches all synthetic input modes, reconstructs the resolved signal
+from every unique recovered candidate, and produces its own diagnostics.
+Period bounds are used only for additional zoomed diagnostic figures.
 """
 
 # %% FILE SYSTEM AND DEPENDENCY SETUP
 
 import sys
+from datetime import datetime
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -13,14 +20,9 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import h5py
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib import cm
-from matplotlib.colors import BoundaryNorm
-from matplotlib.lines import Line2D
-from matplotlib.ticker import MaxNLocator
 from pydmd.utils import pseudo_hankel_matrix
 from tqdm import tqdm
 
-# Project paths / utilities
 from src.msc_thesis.paths import *
 from src.msc_thesis.synSetup import *
 from src.msc_thesis.synUtils import *
@@ -30,446 +32,388 @@ from src.msc_thesis.synVideo import (
     make_dmd_recovery_video,
 )
 
+plt.rcParams.update({"font.size": 11})
+
 
 # %% ------------------------------------------------------
 # USER SETTINGS
 # ------------------------------------------------------
 
-# Every mode listed here is included simultaneously in the synthetic dataset.
-
-# sparse case
-# mode_numbers = [1, 6, 13, 21, 32, 45, 53, 60]
-
-# dense case
-mode_numbers = [ 3,  4,  6, 14, 18, 21, 25, 29, 32,\
-                 36, 40, 45, 48, 54, 59, 60, 62]
-
-#mode_numbers = [ 1,  2,  3,  4,  6, 11, 15, 16, 18,\
-#                 20, 21, 25, 29, 30, 32, 33, 34, 36,\
-#                 37, 38, 39, 41, 43, 45, 48, 53, 54,\
-#                 57, 59, 60, 61, 62]
-
-
-# mode_numbers = np.arange(50, 63, 1)
-
+# Every listed mode is included simultaneously in the synthetic record.
+mode_numbers = [
+    1, 2, 3, 4, 6, 11, 15, 16, 18, 20, 21, 25, 29, 30, 32, 33,
+    34, 36, 37, 38, 39, 41, 43, 45, 48, 53, 54, 57, 59, 60, 61, 62,
+]
 mode_numbers = [str(mode_number) for mode_number in mode_numbers]
 
 DMD_algorithm = "opdmd"
 
-# Optional time-delay embedding applied independently of the DMD algorithm.
+# Optional time-delay embedding. No temporal filtering is applied.
 hankel_embedding_flag = True
 hankel_d = 10
 hankel_reconstruction_method = "first"
 
-# Selected automatically below from the resolved signal and noise-only
-# singular spectra. It is assigned before any DMD estimator is built.
-svd_rank = None
-
-# Plot the cumulative variance explained by the singular values of the matrix
-# used to select the DMD rank, before any SVD truncation is applied. The ideal,
-# clean resolution-mapped, and noise-perturbed runs are compared in one figure.
+# "noise_threshold" uses the unmodified threshold-selected rank.
+# "fixed" passes fixed_svd_rank directly to PyDMD.
+svd_rank_method = "noise_threshold"
+fixed_svd_rank = -1
 singular_value_plot_flag = True
 
-video_plot=True
-
-up_lim_yr_plot = 100
-
-filter_flag = False
-
-# Include analytical ideal candidates in the all-modes period-power plot.
-# Disabled by default because the extra candidate set can clutter the figure.
-show_ideal_all_modes = False
-
-# Optional finite-period window for matching, retained DMD candidates, and
-# plotting. The DMD fit itself always uses the complete combined signal.
-period_limit_flag = True
-period_lower_bound = 1.01
-period_upper_bound = 10
-
-if period_limit_flag:
-    if not (
-        np.isfinite(period_lower_bound)
-        and np.isfinite(period_upper_bound)
-        and 1.0 < period_lower_bound
-        < period_upper_bound
-    ):
-        raise ValueError(
-            "With period_limit_flag=True, bounds must be finite and "
-            "satisfy 1 < period_lower_bound < period_upper_bound. "
-            "The lower bound must exceed 1 year so the requested "
-            "one-year plot margin remains positive on logarithmic axes."
-        )
-
-# ---------------------------------------------------------
-# PERTURBATION ENSEMBLE
-# ---------------------------------------------------------
-
 ensemble_flag = False
-n_realisations = 5
-
-# The noise-only SVD bank is always evaluated for rank selection, independently
-# of whether perturbed signals are subsequently fitted by DMD.
+n_realisations = 1
 n_noise_rank_realisations = n_realisations
 noise_rank_quantile = 0.95
-
 noise_temporal_model = "independent"
 noise_tau_years = 6
 
-
-# ---------------------------------------------------------
-# TIME / DEGREE SETTINGS
-# ---------------------------------------------------------
-
-# True = just use high quality record
+# Record selection and temporal subsampling.
 high_q_flag = True
-# indexing of which time sample spacing to use
 n_skip = 1
 
-# max spherical harmonic degree used
-Nmax = 12
+# Two independent recovery analyses. No degree sweep is performed.
+low_recovery_degree = 10
+high_recovery_degree = 15
+recovery_degrees = {
+    "low": low_recovery_degree,
+    "high": high_recovery_degree,
+}
 
-# When enabled, run cumulative spherical-harmonic truncations 1:n for every
-# integer n up to Nmax. The final Nmax run also supplies all established plots.
-degree_sweep_flag = False
+# Plot-only period window. It never changes fitting, matching, reconstruction,
+# videos, or the candidate arrays retained in the results.
+period_plot_lower_bound = 1.0
+period_plot_upper_bound = 25.0
 
-if (
-    not isinstance(
-        Nmax,
-        (int, np.integer),
+show_ideal_all_modes = False
+video_plot = True
+video_compact_input_threshold = 8
+video_frame_spacing_years = 0.2
+video_fps = 5
+
+# Store one complete run beneath PROJECT_ROOT/results. Set run_label to a
+# short descriptive string to add it to the automatically generated name.
+save_run_outputs = True
+show_figures_interactively = True
+save_numerical_results = True
+figure_output_formats = ("png", "pdf")
+figure_output_dpi = 300
+run_label = None
+
+
+# %% ------------------------------------------------------
+# VALIDATE SETTINGS
+# ------------------------------------------------------
+
+if DMD_algorithm not in ("exact", "fbdmd", "opdmd"):
+    raise ValueError(
+        "DMD_algorithm must be 'exact', 'fbdmd', or 'opdmd'."
     )
-    or Nmax < 1
+
+if svd_rank_method not in ("noise_threshold", "fixed"):
+    raise ValueError(
+        "svd_rank_method must be 'noise_threshold' or 'fixed'."
+    )
+
+if not isinstance(n_skip, (int, np.integer)) or n_skip < 1:
+    raise ValueError("n_skip must be a positive integer.")
+
+if not (
+    isinstance(low_recovery_degree, (int, np.integer))
+    and isinstance(high_recovery_degree, (int, np.integer))
+    and 1 <= low_recovery_degree < high_recovery_degree <= 20
 ):
     raise ValueError(
-        "Nmax must be a positive integer."
+        "Recovery degrees must satisfy "
+        "1 <= low_recovery_degree < high_recovery_degree <= 20."
     )
 
-degree_truncations_tested = np.arange(
-    1,
-    Nmax + 1,
-    dtype=int,
+if not (
+    np.isfinite(period_plot_lower_bound)
+    and np.isfinite(period_plot_upper_bound)
+    and 0.0 < period_plot_lower_bound < period_plot_upper_bound
+):
+    raise ValueError(
+        "Plot period bounds must be finite, positive, and increasing."
+    )
+
+if svd_rank_method == "fixed":
+    fixed_rank_is_integer = (
+        isinstance(fixed_svd_rank, (int, np.integer))
+        and not isinstance(fixed_svd_rank, (bool, np.bool_))
+        and fixed_svd_rank >= -1
+    )
+    fixed_rank_is_energy_fraction = (
+        isinstance(fixed_svd_rank, (float, np.floating))
+        and np.isfinite(fixed_svd_rank)
+        and 0.0 < fixed_svd_rank < 1.0
+    )
+    if not (fixed_rank_is_integer or fixed_rank_is_energy_fraction):
+        raise ValueError(
+            "fixed_svd_rank must follow PyDMD conventions: -1, 0, a "
+            "positive integer, or a floating-point energy fraction in (0, 1)."
+        )
+
+if (
+    svd_rank_method == "noise_threshold"
+    or singular_value_plot_flag
+):
+    if (
+        not isinstance(n_noise_rank_realisations, (int, np.integer))
+        or n_noise_rank_realisations < 1
+    ):
+        raise ValueError(
+            "n_noise_rank_realisations must be a positive integer."
+        )
+    if not (
+        np.isfinite(noise_rank_quantile)
+        and 0.0 < noise_rank_quantile < 1.0
+    ):
+        raise ValueError(
+            "noise_rank_quantile must lie strictly between zero and one."
+        )
+
+if ensemble_flag and (
+    not isinstance(n_realisations, (int, np.integer))
+    or n_realisations < 1
+):
+    raise ValueError(
+        "n_realisations must be positive when ensemble_flag=True."
+    )
+
+if hankel_embedding_flag and (
+    not isinstance(hankel_d, (int, np.integer))
+    or hankel_d < 1
+):
+    raise ValueError(
+        "hankel_d must be a positive integer when embedding is enabled."
+    )
+
+supported_figure_formats = {"png", "pdf", "svg"}
+figure_output_formats = tuple(
+    str(output_format).lower()
+    for output_format in figure_output_formats
 )
+if (
+    not figure_output_formats
+    or not set(figure_output_formats).issubset(
+        supported_figure_formats
+    )
+):
+    raise ValueError(
+        "figure_output_formats must contain one or more of "
+        "'png', 'pdf', or 'svg'."
+    )
+if (
+    not isinstance(figure_output_dpi, (int, np.integer))
+    or figure_output_dpi < 1
+):
+    raise ValueError("figure_output_dpi must be a positive integer.")
+
+
 # %% ------------------------------------------------------
-# BUILD ONE COMBINED SYNTHETIC DATASET
+# RUN OUTPUT DIRECTORY
+# ------------------------------------------------------
+
+run_started_at = datetime.now()
+
+
+def filesystem_safe_label(label):
+    """Return a compact filesystem-safe label."""
+
+    return "".join(
+        character
+        if character.isalnum() or character in ("-", "_")
+        else "_"
+        for character in str(label).strip()
+    ).strip("_")
+
+
+run_output_directory = None
+if save_run_outputs:
+    hankel_run_label = (
+        f"hankel_d{hankel_d}"
+        if hankel_embedding_flag
+        else "noHankel"
+    )
+    if svd_rank_method == "noise_threshold":
+        svd_run_label = "svdNoise"
+    else:
+        fixed_rank_label = (
+            str(fixed_svd_rank)
+            .replace("-", "Minus")
+            .replace(".", "p")
+        )
+        svd_run_label = f"svdFixed{fixed_rank_label}"
+    run_name_parts = [
+        "synthetic",
+        f"N{low_recovery_degree}_{high_recovery_degree}",
+        filesystem_safe_label(DMD_algorithm),
+        hankel_run_label,
+        svd_run_label,
+    ]
+    if run_label:
+        safe_run_label = filesystem_safe_label(run_label)
+        if safe_run_label:
+            run_name_parts.append(safe_run_label)
+    run_name_parts.append(
+        run_started_at.strftime("%Y%m%d_%H%M%S")
+    )
+    run_output_directory = (
+        PROJECT_ROOT
+        / "results"
+        / "_".join(run_name_parts)
+    )
+    collision_index = 1
+    while run_output_directory.exists():
+        run_output_directory = (
+            run_output_directory.parent
+            / (
+                "_".join(run_name_parts)
+                + f"_{collision_index:02d}"
+            )
+        )
+        collision_index += 1
+    run_output_directory.mkdir(parents=True)
+    print(
+        f"Synthetic run outputs: {run_output_directory}"
+    )
+
+
+# %% ------------------------------------------------------
+# BUILD THE COMBINED SYNTHETIC RECORD
 # ------------------------------------------------------
 
 file_path = Path(FELIX_DIR) / "R_splines_arbitrary.h5"
-
-A_r_Nmax = Truncate_Gauss_Coeffs(
-    A_20_dict["r"],
-    tmax=Nmax,
-)
-
-DMD_recovery = {}
 synthetic_suite_info = {}
 gnm_total_ideal_list = []
-gnm_total_res_list = []
+gnm_total_resolved_list = []
 
 with h5py.File(file_path, "r") as h5_file:
-
-    for mode_number in tqdm(
-        mode_numbers,
-        desc="Loading combined modes",
-    ):
-
-        mode_data = Component_Load_SV(
-            mode_number
-        )
-
-        eigenvalue = mode_data["eigenvalue"]
-        gnm_phasor = mode_data["gnm"]
-
-        true_period = (
-            2.0
-            * np.pi
-            / np.abs(eigenvalue.imag)
-        )
-
-        gnm_phasor_Nmax = Truncate_Gauss_Coeffs(
-            gnm_phasor,
-            tmax=Nmax,
-        )
-
+    for mode_number in tqdm(mode_numbers, desc="Loading combined modes"):
+        mode_data = Component_Load_SV(mode_number)
+        eigenvalue = complex(mode_data["eigenvalue"])
         gnm_phasor_degree_20 = Truncate_Gauss_Coeffs(
-            gnm_phasor,
+            mode_data["gnm"],
             tmax=20,
         )
+        true_period = 2.0 * np.pi / np.abs(eigenvalue.imag)
 
         try:
-            amp_scaler = mode_amp_scalings[
-                str(mode_number)
-            ]
+            amplitude_scaler = mode_amp_scalings[mode_number]
         except KeyError as exc:
             raise KeyError(
                 f"No amplitude scaling found for mode {mode_number}."
             ) from exc
 
-        gnm_phasor_scaled = (
-            amp_scaler
-            * gnm_phasor_Nmax
-        )
-
-        # Analytical ideal SV: evaluate the scaled SV phasor directly.
-        # This path deliberately applies no P, R, or H_sv operator.
+        scaled_phasor = amplitude_scaler * gnm_phasor_degree_20
         gnm_mode_ideal = G_Time_Series_Eval(
-            amp_scaler
-            * gnm_phasor_degree_20,
+            scaled_phasor,
             eigenvalue,
         )
 
-        gnm_total_ideal_list.append(
-            gnm_mode_ideal
-        )
-
-        dataset_name = (
-            f"mode_{mode_number}/without_decay"
-        )
-
+        dataset_name = f"mode_{mode_number}/without_decay"
         if dataset_name not in h5_file:
-            raise KeyError(
-                f"Missing HDF5 dataset: {dataset_name}"
-            )
+            raise KeyError(f"Missing HDF5 dataset: {dataset_name}")
 
-        gnm_spline = np.asarray(
-            h5_file[dataset_name][()]
+        gnm_spline = np.asarray(h5_file[dataset_name][()])
+        gnm_mode_resolved = H_sv @ (
+            amplitude_scaler * gnm_spline
         )
 
-        gnm_spline_scaled = (
-            amp_scaler
-            * gnm_spline
-        )
-
-        # Existing project resolution mapping.
-        gnm_mode_res = (
-            H_sv
-            @ gnm_spline_scaled
-        )
-
-        gnm_total_res_list.append(
-            gnm_mode_res
-        )
-
-        synthetic_suite_info[
-            mode_number
-        ] = {
-            "true_period": true_period,
+        synthetic_suite_info[mode_number] = {
+            "true_period": float(true_period),
             "true_eigenvalue": eigenvalue,
-            "gnm_phasor": gnm_phasor_scaled,
+            "gnm_phasor": scaled_phasor,
             "gnm_ideal": gnm_mode_ideal,
-            "gnm_resolved": gnm_mode_res,
+            "gnm_resolved": gnm_mode_resolved,
         }
+        gnm_total_ideal_list.append(gnm_mode_ideal)
+        gnm_total_resolved_list.append(gnm_mode_resolved)
 
-        DMD_recovery[
-            mode_number
-        ] = {
-            "true_period": true_period,
-            "true_eigenvalue": eigenvalue,
-            "DMD_ideal": {},
-            "DMD": {},
-            "DMD_noised": {},
-        }
-
-gnm_total_ideal = np.sum(
-    np.asarray(gnm_total_ideal_list),
+gnm_total_ideal = np.sum(np.asarray(gnm_total_ideal_list), axis=0)
+gnm_total_resolved = np.sum(
+    np.asarray(gnm_total_resolved_list),
     axis=0,
 )
-
-gnm_total_res = np.sum(
-    np.asarray(gnm_total_res_list),
-    axis=0,
-)
-
 del gnm_total_ideal_list
-del gnm_total_res_list
+del gnm_total_resolved_list
 
 
 # %% ------------------------------------------------------
-# GENERATE THE ALWAYS-ON NOISE BANK
+# BUILD A COMMON NOISE BANK
 # ------------------------------------------------------
 
-if (
-    not isinstance(
-        n_noise_rank_realisations,
-        (int, np.integer),
-    )
-    or n_noise_rank_realisations < 1
-):
-    raise ValueError(
-        "n_noise_rank_realisations must be a positive integer."
-    )
-
-if not (
-    np.isfinite(noise_rank_quantile)
-    and 0.0 < noise_rank_quantile < 1.0
-):
-    raise ValueError(
-        "noise_rank_quantile must be finite and lie strictly "
-        "between zero and one."
-    )
-
-if ensemble_flag and (
-    not isinstance(
-        n_realisations,
-        (int, np.integer),
-    )
-    or n_realisations < 1
-):
-    raise ValueError(
-        "n_realisations must be a positive integer when "
-        "ensemble_flag=True."
-    )
-
+noise_diagnostics_required = (
+    svd_rank_method == "noise_threshold"
+    or singular_value_plot_flag
+)
 noise_bank_size = max(
-    n_noise_rank_realisations,
+    n_noise_rank_realisations if noise_diagnostics_required else 0,
     n_realisations if ensemble_flag else 0,
 )
 
-noise_only_bank = Perturbation_Generate(
-    gnm_total_res,
-    n_realisations=noise_bank_size,
-    temporal_z=noise_temporal_model,
-    tau=noise_tau_years,
-    dt=dt_years,
-    just_noise=True,
-)
+if noise_bank_size:
+    noise_only_bank = Perturbation_Generate(
+        gnm_total_resolved,
+        n_realisations=noise_bank_size,
+        temporal_z=noise_temporal_model,
+        tau=noise_tau_years,
+        dt=dt_years,
+        just_noise=True,
+    )
+else:
+    noise_only_bank = np.empty(
+        (0, *gnm_total_resolved.shape),
+        dtype=float,
+    )
 
 noise_only_rank_bank = noise_only_bank[
     :n_noise_rank_realisations
-]
+] if noise_diagnostics_required else noise_only_bank[:0]
 
-queue = [
+fit_queue = [
     ("ideal", gnm_total_ideal),
-    ("no_noise", gnm_total_res),
+    ("resolved", gnm_total_resolved),
 ]
-
 if ensemble_flag:
-    noised = (
-        noise_only_bank[:n_realisations]
-        + gnm_total_res[
-            None,
-            :,
-            :,
-        ]
+    fit_queue.extend(
+        ("perturbed", gnm_total_resolved + noise_realisation)
+        for noise_realisation in noise_only_bank[:n_realisations]
     )
-    queue.extend(
-        ("noised", realisation)
-        for realisation in noised
-    )
-
-
-for mode_number in mode_numbers:
-
-    DMD_recovery[
-        mode_number
-    ]["DMD_noised"]= {
-        "similarity": [],
-        "eigenvalue": [],
-        "recovered_period": [],
-    }
 
 
 # %% ------------------------------------------------------
-# DMD TESTS
+# SHARED DMD HELPERS
 # ------------------------------------------------------
 
-# skipping time steps (as very dense) - ensure DMD understands
-# equivalent real time between steps
-dt_snapshot = (
-    n_skip
-    * dt_years
-)
-
-# Getting the A_r projection operator for up to Nmax
-A_r_current = Truncate_Gauss_Coeffs(
-    A_20_dict["r"],
-    tmax=Nmax,
-)
-
-# Precompute every target theoretical phasor once for this degree band.
-target_phasors = {}
-
-for mode_number in mode_numbers:
-
-    gnm_target = (
-        synthetic_suite_info[
-            mode_number
-        ]["gnm_phasor"]
-    )
-
-    gnm_target_band = Truncate_Gauss_Coeffs(
-        gnm_target,
-        tmax=Nmax,
-    )
-
-    target_phasors[
-        mode_number
-    ] = (
-        A_r_current
-        @ gnm_target_band.T
-    )
-
-if period_limit_flag:
-    matching_mode_numbers = [
-        mode_number
-        for mode_number in mode_numbers
-        if (
-            period_lower_bound
-            <= synthetic_suite_info[
-                mode_number
-            ]["true_period"]
-            <= period_upper_bound
-        )
-    ]
+if high_q_flag:
+    analysis_times_absolute = times_absolute[good_record_slice]
 else:
-    matching_mode_numbers = (
-        mode_numbers.copy()
-    )
+    analysis_times_absolute = times_absolute.copy()
+analysis_times_absolute = analysis_times_absolute[::n_skip]
 
-clean_candidate_eigs = None
-clean_candidate_modes = None
-clean_candidate_periods = None
-video_sum_candidate_eigs = None
-video_sum_candidate_modes = None
-ideal_candidate_eigs = None
-ideal_candidate_modes = None
-ideal_candidate_periods = None
-singular_value_cumulative_variance = {
-    "ideal": None,
-    "resolved": None,
-    "perturbed": [],
-    "noise_only": [],
-}
-singular_value_magnitudes = {
-    "ideal": None,
-    "resolved": None,
-    "perturbed": [],
-    "noise_only": [],
-}
+if analysis_times_absolute.size < 2:
+    raise ValueError("At least two selected snapshots are required.")
 
-if DMD_algorithm not in (
-    "exact",
-    "fbdmd",
-    "opdmd",
+snapshot_differences = np.diff(analysis_times_absolute)
+dt_snapshot = float(np.median(snapshot_differences))
+if not np.allclose(
+    snapshot_differences,
+    dt_snapshot,
+    rtol=1e-8,
+    atol=1e-10,
 ):
+    raise ValueError("Selected snapshots are not uniformly sampled.")
+
+if hankel_embedding_flag and hankel_d >= analysis_times_absolute.size:
     raise ValueError(
-        "DMD_algorithm must be one of "
-        "'exact', 'fbdmd', or 'opdmd'. "
-        f"Received {DMD_algorithm!r}."
+        f"hankel_d={hankel_d} leaves too few embedded snapshots."
     )
 
-if (
-    hankel_embedding_flag
-    and (
-        not isinstance(
-            hankel_d,
-            (int, np.integer),
-        )
-        or hankel_d < 1
-    )
-):
-    raise ValueError(
-        "hankel_d must be a positive integer when "
-        "Hankel embedding is enabled."
-    )
+evaluation_times = (
+    analysis_times_absolute
+    - analysis_times_absolute[0]
+)
+spatial_weights = np.asarray(W2D, dtype=float).ravel()
 
 
 def prepare_sv_input_for_dmd(
@@ -477,2646 +421,1229 @@ def prepare_sv_input_for_dmd(
     truncation_degree,
     projection_operator,
 ):
-    """Apply the common temporal, degree, grid, and sampling operations."""
+    """Window, degree-truncate, project, and subsample one coefficient record."""
 
     if high_q_flag:
-        gnm_input_windowed = (
-            gnm_input[
-                good_record_slice,
-                :
-            ]
-        )
+        gnm_windowed = gnm_input[good_record_slice, :]
     else:
-        gnm_input_windowed = gnm_input
+        gnm_windowed = gnm_input
 
-    if filter_flag:
-        gnm_input_windowed, _, _ = (
-            Long_Period_Taper_Filter(
-                gnm_input_windowed,
-                dt=dt_years,
-                pass_period=10.0,
-                stop_period=20.0,
-                axis=0,
-            )
-        )
-
-    gnm_input_band = Truncate_Gauss_Coeffs(
-        gnm_input_windowed,
+    gnm_band = Truncate_Gauss_Coeffs(
+        gnm_windowed,
         tmax=truncation_degree,
     )
+    sv_input = projection_operator @ gnm_band.T
+    sv_input = sv_input[:, ::n_skip]
 
-    sv_input_all_steps = (
-        projection_operator
-        @ gnm_input_band.T
+    expected_shape = (
+        state_shape[0] * state_shape[1],
+        analysis_times_absolute.size,
     )
-
-    return (
-        sv_input_all_steps[
-            :,
-            ::n_skip
-        ]
-    )
-
-
-def calculate_pretruncation_spectrum(
-    sv_input,
-    result_label,
-):
-    """Calculate the spectrum of the matrix used to select the DMD rank."""
-
-    n_physical = (
-        sv_input.shape[0]
-    )
-
-    n_snapshots = (
-        sv_input.shape[1]
-    )
-
-    if (
-        hankel_embedding_flag
-        and (
-            not isinstance(
-                hankel_d,
-                (int, np.integer),
-            )
-            or hankel_d < 1
-        )
-    ):
+    if sv_input.shape != expected_shape:
         raise ValueError(
-            "hankel_d must be a positive integer when "
-            "Hankel embedding is enabled."
+            f"Unexpected SV input shape at n={truncation_degree}: "
+            f"{sv_input.shape} vs {expected_shape}."
         )
-
-    if (
-        hankel_embedding_flag
-        and hankel_d > n_snapshots
-    ):
+    if not np.all(np.isfinite(sv_input)):
         raise ValueError(
-            f"hankel_d={hankel_d} exceeds the "
-            f"{n_snapshots} available snapshots."
+            f"SV input contains non-finite values at n={truncation_degree}."
         )
+    return sv_input
+
+
+def pre_truncation_svd_input(sv_input):
+    """Return the matrix used by the selected estimator for rank selection."""
 
     if hankel_embedding_flag:
-        svd_input = pseudo_hankel_matrix(
-            sv_input,
-            d=hankel_d,
-        )
+        matrix = pseudo_hankel_matrix(sv_input, d=hankel_d)
     else:
-        svd_input = sv_input
-
+        matrix = sv_input
     if DMD_algorithm in ("exact", "fbdmd"):
-        # These estimators choose the truncation rank from the leading
-        # snapshot matrix X. FbDMD's backward calculation uses the
-        # shifted Y matrix at that already-selected rank.
-        svd_input = svd_input[:, :-1]
+        matrix = matrix[:, :-1]
+    return matrix
 
-    singular_value_magnitude = np.abs(
+
+def calculate_singular_diagnostic(sv_input):
+    """Return raw singular magnitudes and cumulative squared energy."""
+
+    magnitudes = np.abs(
         np.linalg.svd(
-            svd_input,
+            pre_truncation_svd_input(sv_input),
             compute_uv=False,
         )
     )
-    singular_value_variance = np.square(
-        singular_value_magnitude
-    )
-    total_singular_value_variance = np.sum(
-        singular_value_variance
-    )
-
-    if (
-        not np.isfinite(
-            total_singular_value_variance
-        )
-        or total_singular_value_variance <= 0.0
-    ):
+    variance = np.square(magnitudes)
+    total_variance = np.sum(variance)
+    if not np.isfinite(total_variance) or total_variance <= 0.0:
         raise ValueError(
-            "Cannot calculate a singular spectrum for "
-            f"{result_label!r} because its total squared "
-            "singular-value magnitude is not finite and positive."
+            "The pre-truncation singular-value energy is not positive."
+        )
+    return {
+        "magnitude": magnitudes,
+        "cumulative_variance": np.cumsum(variance) / total_variance,
+    }
+
+
+def select_degree_svd_rank(truncation_degree, projection_operator):
+    """Select the rank independently at one spherical-harmonic degree."""
+
+    resolved_sv = prepare_sv_input_for_dmd(
+        gnm_total_resolved,
+        truncation_degree,
+        projection_operator,
+    )
+    resolved_diagnostic = calculate_singular_diagnostic(resolved_sv)
+    noise_diagnostics = [
+        calculate_singular_diagnostic(
+            prepare_sv_input_for_dmd(
+                noise_realisation,
+                truncation_degree,
+                projection_operator,
+            )
+        )
+        for noise_realisation in noise_only_rank_bank
+    ]
+
+    if svd_rank_method == "fixed":
+        return (
+            fixed_svd_rank,
+            None,
+            None,
+            resolved_diagnostic,
+            noise_diagnostics,
         )
 
-    cumulative_variance = np.cumsum(
-        singular_value_variance
-    ) / total_singular_value_variance
+    leading_noise = np.asarray([
+        diagnostic["magnitude"][0]
+        for diagnostic in noise_diagnostics
+    ])
+    noise_threshold = float(
+        np.quantile(leading_noise, noise_rank_quantile)
+    )
+    base_noise_rank = int(
+        np.count_nonzero(
+            resolved_diagnostic["magnitude"] > noise_threshold
+        )
+    )
+    if base_noise_rank < 1:
+        raise RuntimeError(
+            "The noise threshold retained no resolved singular values at "
+            f"n={truncation_degree}; threshold={noise_threshold:.6e}."
+        )
 
     return (
-        singular_value_magnitude,
-        cumulative_variance,
+        base_noise_rank,
+        base_noise_rank,
+        noise_threshold,
+        resolved_diagnostic,
+        noise_diagnostics,
     )
 
 
-def fit_dmd_candidate_suite(
-    sv_input,
-    selected_svd_rank,
-):
-    """Fit the configured DMD estimator and return its candidate suite."""
-
-    n_physical = (
-        sv_input.shape[0]
-    )
-    n_snapshots = (
-        sv_input.shape[1]
-    )
-
+def build_selected_dmd(selected_svd_rank):
     if DMD_algorithm == "exact":
-        base_dmd = build_exact_dmd(
-            svd_rank=selected_svd_rank
-        )
+        return build_exact_dmd(svd_rank=selected_svd_rank)
+    if DMD_algorithm == "fbdmd":
+        return build_fbdmd(svd_rank=selected_svd_rank)
+    return build_bopdmd(svd_rank=selected_svd_rank)
 
-    elif DMD_algorithm == "fbdmd":
-        base_dmd = build_fbdmd(
-            svd_rank=selected_svd_rank
-        )
 
-    elif DMD_algorithm == "opdmd":
-        base_dmd = build_bopdmd(
-            svd_rank=selected_svd_rank
-        )
+def fit_candidate_suite(sv_input, selected_svd_rank):
+    """Fit DMD and retain every physical candidate exactly once."""
 
-    else:
-        raise ValueError(
-            "DMD_algorithm must be one of "
-            "'exact', 'fbdmd', or 'opdmd'. "
-            f"Received {DMD_algorithm!r}."
-        )
-
+    n_physical, n_snapshots = sv_input.shape
+    base_dmd = build_selected_dmd(selected_svd_rank)
     dmd = apply_hankel_embedding(
         base_dmd,
         enabled=hankel_embedding_flag,
         d=hankel_d,
-        reconstruction_method=
-            hankel_reconstruction_method,
+        reconstruction_method=hankel_reconstruction_method,
     )
-
-    embedding_d = (
-        hankel_d
-        if hankel_embedding_flag
-        else None
-    )
+    embedding_d = hankel_d if hankel_embedding_flag else None
 
     if DMD_algorithm == "opdmd":
         n_fit_snapshots = (
-            n_snapshots
-            - hankel_d
-            + 1
+            n_snapshots - hankel_d + 1
             if hankel_embedding_flag
             else n_snapshots
         )
-
-        fit_times = (
-            np.arange(
-                n_fit_snapshots
-            )
-            * dt_snapshot
-        )
-
         dmd.fit(
             sv_input,
-            fit_times,
+            np.arange(n_fit_snapshots, dtype=float) * dt_snapshot,
         )
-
-        return extract_optimized_dmd_candidates(
+        eigenvalues, modes, periods = extract_optimized_dmd_candidates(
             dmd=dmd,
             n_physical=n_physical,
             embedding_d=embedding_d,
         )
-
-    dmd.fit(
-        sv_input
-    )
-
-    return extract_standard_dmd_candidates(
-        dmd=dmd,
-        dt_snapshot=dt_snapshot,
-        n_physical=n_physical,
-        embedding_d=embedding_d,
-    )
-
-
-def select_degree_svd_rank(
-    truncation_degree,
-    projection_operator,
-):
-    """Apply the existing noise-threshold rank rule at one degree."""
-
-    resolved_sv_input = prepare_sv_input_for_dmd(
-        gnm_total_res,
-        truncation_degree=truncation_degree,
-        projection_operator=projection_operator,
-    )
-    (
-        resolved_magnitudes,
-        _,
-    ) = calculate_pretruncation_spectrum(
-        resolved_sv_input,
-        result_label=(
-            "clean resolved signal at spherical-harmonic "
-            f"truncation {truncation_degree}"
-        ),
-    )
-
-    noise_leading_values = []
-
-    for noise_index, noise_realisation in enumerate(
-        noise_only_rank_bank
-    ):
-        noise_sv_input = prepare_sv_input_for_dmd(
-            noise_realisation,
-            truncation_degree=truncation_degree,
-            projection_operator=projection_operator,
-        )
-        (
-            noise_magnitudes,
-            _,
-        ) = calculate_pretruncation_spectrum(
-            noise_sv_input,
-            result_label=(
-                "noise-only realisation "
-                f"{noise_index} at spherical-harmonic "
-                f"truncation {truncation_degree}"
-            ),
-        )
-        noise_leading_values.append(
-            noise_magnitudes[0]
+    else:
+        dmd.fit(sv_input)
+        eigenvalues, modes, periods = extract_standard_dmd_candidates(
+            dmd=dmd,
+            dt_snapshot=dt_snapshot,
+            n_physical=n_physical,
+            embedding_d=embedding_d,
         )
 
-    noise_threshold = float(
-        np.quantile(
-            np.asarray(
-                noise_leading_values,
-                dtype=float,
-            ),
-            noise_rank_quantile,
+    eigenvalues = np.asarray(eigenvalues, dtype=complex).ravel()
+    modes = np.asarray(modes, dtype=complex)
+    periods = np.asarray(periods, dtype=float).ravel()
+    if modes.shape != (n_physical, eigenvalues.size):
+        raise ValueError("Extracted DMD candidates do not align.")
+
+    candidate_ids = np.arange(eigenvalues.size, dtype=int)
+    oscillatory = np.isfinite(periods) & (periods > 0.0)
+    static = np.isposinf(periods)
+    oscillatory_order = np.argsort(periods[oscillatory])
+    oscillatory_indices = np.flatnonzero(oscillatory)[oscillatory_order]
+    static_indices = np.flatnonzero(static)
+    retained_indices = np.concatenate(
+        (oscillatory_indices, static_indices)
+    )
+
+    reconstruction_eigenvalues = eigenvalues[retained_indices]
+    reconstruction_modes = modes[:, retained_indices]
+    reconstruction_periods = periods[retained_indices]
+    reconstruction_ids = candidate_ids[retained_indices]
+
+    oscillatory_count = oscillatory_indices.size
+    oscillatory_eigenvalues = reconstruction_eigenvalues[
+        :oscillatory_count
+    ]
+    oscillatory_modes = reconstruction_modes[:, :oscillatory_count]
+    oscillatory_periods = reconstruction_periods[:oscillatory_count]
+    oscillatory_ids = reconstruction_ids[:oscillatory_count]
+    powers = np.asarray([
+        SV_Grid_Phasor_Record_Power(
+            oscillatory_modes[:, index],
+            oscillatory_eigenvalues[index],
+            evaluation_times=evaluation_times,
+            spatial_weights=spatial_weights,
         )
-    )
-
-    selected_svd_rank = int(
-        np.count_nonzero(
-            resolved_magnitudes
-            > noise_threshold
-        )
-    )
-
-    if selected_svd_rank == 0:
-        raise RuntimeError(
-            "The noise-threshold rank criterion retained no resolved "
-            "singular values at spherical-harmonic truncation "
-            f"n={truncation_degree}. No DMD fit was attempted for "
-            f"that degree. The threshold was {noise_threshold:.6e}, "
-            f"derived from the q={noise_rank_quantile:.3f} quantile "
-            f"of {n_noise_rank_realisations} noise-only leading "
-            "singular values."
-        )
-
-    return (
-        selected_svd_rank,
-        noise_threshold,
-    )
-
-
-def make_degree_sweep_candidate_store(
-    raw_candidate_periods,
-    retained_candidate_periods,
-):
-    """Store retained periods and the raw infinite-period candidates."""
-
-    raw_candidate_periods = np.asarray(
-        raw_candidate_periods,
-        dtype=float,
-    )
+        for index in range(oscillatory_count)
+    ])
 
     return {
-        "recovered_period": np.asarray(
-            retained_candidate_periods,
+        "effective_svd_rank": int(np.asarray(dmd.modes).shape[1]),
+        "eigenvalue": oscillatory_eigenvalues,
+        "mode": oscillatory_modes,
+        "period": oscillatory_periods,
+        "candidate_id": oscillatory_ids,
+        "power": powers,
+        "static_count": int(static_indices.size),
+        "reconstruction_eigenvalue": reconstruction_eigenvalues,
+        "reconstruction_mode": reconstruction_modes,
+        "reconstruction_period": reconstruction_periods,
+        "reconstruction_candidate_id": reconstruction_ids,
+    }
+
+
+def evaluate_candidate_sum(eigenvalues, modes, relative_times):
+    """Evaluate all unique continuous-time candidates and sum them."""
+
+    if eigenvalues.size == 0:
+        return np.zeros(
+            (modes.shape[0], relative_times.size),
             dtype=float,
-        ).copy(),
-        "static_recovered_period": (
-            raw_candidate_periods[
-                np.isinf(
-                    raw_candidate_periods
-                )
-            ].copy()
-        ),
-    }
+        )
+    dynamics = np.exp(
+        eigenvalues[:, None] * relative_times[None, :]
+    )
+    return np.real(modes @ dynamics)
 
 
-degree_sweep_results = None
+def area_weighted_rms(records):
+    """Area-weighted RMS across the spatial grid at each time."""
 
-if degree_sweep_flag:
-    degree_sweep_results = {
-        "metadata": {
-            "degree_definition": (
-                "cumulative spherical-harmonic degrees 1:n"
-            ),
-            "period_limit_enabled": bool(
-                period_limit_flag
-            ),
-            "period_lower_bound": (
-                float(period_lower_bound)
-                if period_limit_flag
-                else None
-            ),
-            "period_upper_bound": (
-                float(period_upper_bound)
-                if period_limit_flag
-                else None
-            ),
-            "svd_rank_selection": (
-                "number of clean resolved singular values strictly "
-                "greater than the selected quantile of noise-only "
-                "leading singular values, evaluated independently "
-                "at each degree truncation"
-            ),
-            "ensemble_enabled": bool(
-                ensemble_flag
-            ),
-            "n_realisations": (
-                int(n_realisations)
-                if ensemble_flag
-                else 0
-            ),
-            "noise_rank_quantile": float(
-                noise_rank_quantile
-            ),
-            "noise_rank_realisations": int(
-                n_noise_rank_realisations
-            ),
-        },
-        "degree_truncations": (
-            degree_truncations_tested.copy()
-        ),
-        "by_degree": {},
-    }
+    records = np.asarray(records)
+    return np.sqrt(
+        np.sum(
+            spatial_weights[:, None] * np.square(records),
+            axis=0,
+        )
+        / np.sum(spatial_weights)
+    )
 
-    # Run every lower truncation here. The existing main workflow below is
-    # retained as the sole Nmax run and supplies all established diagnostics.
-    for truncation_degree in tqdm(
-        degree_truncations_tested[:-1],
-        desc="Cumulative degree sweep",
-    ):
-        truncation_degree = int(
-            truncation_degree
+
+def candidate_matched_inputs(candidate_count, recovery, result_key):
+    matched_inputs = [[] for _ in range(candidate_count)]
+    for mode_number, mode_result in recovery.items():
+        match = mode_result.get(result_key, {})
+        if "candidate_index" in match:
+            matched_inputs[int(match["candidate_index"])].append(mode_number)
+    return matched_inputs
+
+
+def finite_period_limits(recovery, suites):
+    periods = [
+        float(result["true_period"])
+        for result in recovery.values()
+    ]
+    for suite in suites:
+        periods.extend(
+            np.asarray(suite["period"], dtype=float).tolist()
+        )
+    periods = np.asarray(periods, dtype=float)
+    periods = periods[np.isfinite(periods) & (periods > 0.0)]
+    if periods.size == 0:
+        return (period_plot_lower_bound, period_plot_upper_bound)
+    lower = max(np.min(periods) / 1.15, np.finfo(float).tiny)
+    upper = np.max(periods) * 1.15
+    if not lower < upper:
+        upper = lower * 1.1
+    return (float(lower), float(upper))
+
+
+# %% ------------------------------------------------------
+# INDEPENDENT LOW/HIGH ANALYSES
+# ------------------------------------------------------
+
+def analyse_recovery_degree(case_label, truncation_degree):
+    print(
+        f"\nSYNTHETIC DMD: {case_label.upper()} RECOVERY "
+        f"(n <= {truncation_degree})"
+    )
+
+    projection_operator = Truncate_Gauss_Coeffs(
+        A_20_dict["r"],
+        tmax=truncation_degree,
+    )
+    expected_coefficients = (truncation_degree + 1) ** 2 - 1
+    expected_projection_shape = (
+        state_shape[0] * state_shape[1],
+        expected_coefficients,
+    )
+    if projection_operator.shape != expected_projection_shape:
+        raise ValueError(
+            f"Unexpected projection shape at n={truncation_degree}: "
+            f"{projection_operator.shape}."
         )
 
-        projection_operator = Truncate_Gauss_Coeffs(
-            A_20_dict["r"],
-            tmax=truncation_degree,
-        )
+    (
+        selected_svd_rank,
+        base_noise_rank,
+        noise_threshold,
+        resolved_singular_diagnostic,
+        noise_singular_diagnostics,
+    ) = select_degree_svd_rank(
+        truncation_degree,
+        projection_operator,
+    )
 
-        (
-            degree_svd_rank,
-            degree_noise_threshold,
-        ) = select_degree_svd_rank(
+    suites = {"perturbed": []}
+    singular_diagnostics = {
+        "resolved": resolved_singular_diagnostic,
+        "ideal": None,
+        "perturbed": [],
+        "noise_only": noise_singular_diagnostics,
+    }
+    sv_inputs = {}
+
+    for input_label, gnm_input in fit_queue:
+        sv_input = prepare_sv_input_for_dmd(
+            gnm_input,
             truncation_degree,
             projection_operator,
         )
-
-        degree_store = {
-            "svd_rank": int(
-                degree_svd_rank
-            ),
-            "noise_singular_value_threshold": float(
-                degree_noise_threshold
-            ),
-            "ideal": None,
-            "resolved": None,
-            "perturbed": [],
-        }
-
-        perturbed_realisation_index = 0
-
-        for result_type, gnm_input in tqdm(
-            queue,
-            desc=(
-                "Degrees 1-"
-                f"{truncation_degree}, "
-                f"rank={degree_svd_rank}"
-            ),
-            leave=False,
-        ):
-            sv_input = prepare_sv_input_for_dmd(
-                gnm_input,
-                truncation_degree=truncation_degree,
-                projection_operator=projection_operator,
-            )
-
-            (
-                candidate_eigs,
-                candidate_modes,
-                raw_candidate_periods,
-            ) = fit_dmd_candidate_suite(
-                sv_input,
-                selected_svd_rank=degree_svd_rank,
-            )
-
-            candidate_periods = (
-                raw_candidate_periods
-            )
-
-            if period_limit_flag:
-                (
-                    candidate_eigs,
-                    candidate_modes,
-                    candidate_periods,
-                ) = filter_candidate_period_range(
-                    candidate_eigs,
-                    candidate_modes,
-                    candidate_periods,
-                    lower_period=period_lower_bound,
-                    upper_period=period_upper_bound,
-                )
-
-            candidate_store = (
-                make_degree_sweep_candidate_store(
-                    raw_candidate_periods,
-                    candidate_periods,
-                )
-            )
-
-            if result_type == "ideal":
-                degree_store[
-                    "ideal"
-                ] = candidate_store
-
-            elif result_type == "no_noise":
-                degree_store[
-                    "resolved"
-                ] = candidate_store
-
-            elif result_type == "noised":
-                candidate_store[
-                    "realisation_index"
-                ] = int(
-                    perturbed_realisation_index
-                )
-                degree_store[
-                    "perturbed"
-                ].append(
-                    candidate_store
-                )
-                perturbed_realisation_index += 1
-
-            else:
-                raise ValueError(
-                    f"Unknown DMD result type: {result_type}"
-                )
-
-        degree_sweep_results[
-            "by_degree"
-        ][truncation_degree] = degree_store
-
-
-# %% ------------------------------------------------------
-# ALWAYS-ON NOISE-THRESHOLD RANK SELECTION
-# ------------------------------------------------------
-
-for (
-    result_key,
-    result_label,
-    gnm_input,
-) in (
-    (
-        "ideal",
-        "ideal signal",
-        gnm_total_ideal,
-    ),
-    (
-        "resolved",
-        "clean resolved signal",
-        gnm_total_res,
-    ),
-):
-    sv_input = prepare_sv_input_for_dmd(
-        gnm_input,
-        truncation_degree=Nmax,
-        projection_operator=A_r_current,
-    )
-    (
-        singular_value_magnitudes[
-            result_key
-        ],
-        singular_value_cumulative_variance[
-            result_key
-        ],
-    ) = calculate_pretruncation_spectrum(
-        sv_input,
-        result_label=result_label,
-    )
-    del sv_input
-
-for noise_index, noise_realisation in enumerate(
-    tqdm(
-        noise_only_rank_bank,
-        desc="Noise-only SVD rank bank",
-        leave=False,
-    )
-):
-    noise_sv_input = prepare_sv_input_for_dmd(
-        noise_realisation,
-        truncation_degree=Nmax,
-        projection_operator=A_r_current,
-    )
-    (
-        noise_magnitude,
-        noise_cumulative_variance,
-    ) = calculate_pretruncation_spectrum(
-        noise_sv_input,
-        result_label=(
-            "noise-only realisation "
-            f"{noise_index}"
-        ),
-    )
-    singular_value_magnitudes[
-        "noise_only"
-    ].append(
-        noise_magnitude
-    )
-    singular_value_cumulative_variance[
-        "noise_only"
-    ].append(
-        noise_cumulative_variance
-    )
-    del noise_sv_input
-
-noise_leading_singular_values = np.asarray([
-    spectrum[0]
-    for spectrum in singular_value_magnitudes[
-        "noise_only"
-    ]
-])
-
-noise_singular_value_threshold = float(
-    np.quantile(
-        noise_leading_singular_values,
-        noise_rank_quantile,
-    )
-)
-
-resolved_singular_value_magnitude = (
-    singular_value_magnitudes[
-        "resolved"
-    ]
-)
-
-svd_rank = int(
-    np.count_nonzero(
-        resolved_singular_value_magnitude
-        > noise_singular_value_threshold
-    )
-)
-
-if svd_rank == 0:
-    raise RuntimeError(
-        "The noise-threshold rank criterion retained no resolved "
-        "singular values. No DMD fit was attempted. The threshold "
-        f"was {noise_singular_value_threshold:.6e}, derived from "
-        f"the q={noise_rank_quantile:.3f} quantile of "
-        f"{n_noise_rank_realisations} noise-only leading singular "
-        "values."
-    )
-
-print(
-    "\nNOISE-THRESHOLD SVD RANK SELECTION\n"
-    f"Noise-only realisations: {n_noise_rank_realisations}\n"
-    f"Leading-noise quantile: q={noise_rank_quantile:.3f}\n"
-    f"Noise singular-value threshold: "
-    f"{noise_singular_value_threshold:.6e}\n"
-    f"Selected DMD rank: {svd_rank}"
-)
-
-if degree_sweep_flag:
-    degree_sweep_results[
-        "by_degree"
-    ][int(Nmax)] = {
-        "svd_rank": int(
-            svd_rank
-        ),
-        "noise_singular_value_threshold": float(
-            noise_singular_value_threshold
-        ),
-        "ideal": None,
-        "resolved": None,
-        "perturbed": [],
-    }
-
-# Area weights and time coordinates used by the existing record-mean power
-# definition. Candidate powers are evaluated immediately after each perturbed
-# DMD fit so complete spatial candidate suites do not need to be retained.
-sv_grid_weights = W2D.ravel()
-
-if high_q_flag:
-    analysis_times_absolute = (
-        times_absolute[
-            good_record_slice
-        ]
-    )
-else:
-    analysis_times_absolute = (
-        times_absolute.copy()
-    )
-
-analysis_times_absolute = (
-    analysis_times_absolute[
-        ::n_skip
-    ]
-)
-
-truth_power_times = (
-    analysis_times_absolute
-    - times_absolute[0]
-)
-
-dmd_power_times = (
-    analysis_times_absolute
-    - analysis_times_absolute[0]
-)
-
-ensemble_candidate_modal_power_results = {
-    "true_period": [],
-    "true_power": [],
-    "true_mode_number": [],
-    "recovered_period": [],
-    "recovered_power": [],
-    "realisation_index": [],
-}
-
-for mode_number in mode_numbers:
-    true_eigenvalue = synthetic_suite_info[
-        mode_number
-    ]["true_eigenvalue"]
-
-    ensemble_candidate_modal_power_results[
-        "true_period"
-    ].append(
-        synthetic_suite_info[
-            mode_number
-        ]["true_period"]
-    )
-    ensemble_candidate_modal_power_results[
-        "true_power"
-    ].append(
-        SV_Grid_Phasor_Record_Power(
-            target_phasors[
-                mode_number
-            ],
-            true_eigenvalue,
-            evaluation_times=truth_power_times,
-            spatial_weights=sv_grid_weights,
-        )
-    )
-    ensemble_candidate_modal_power_results[
-        "true_mode_number"
-    ].append(
-        mode_number
-    )
-
-noised_realisation_index = 0
-
-
-# %% ------------------------------------------------------
-# DMD FITS
-# ------------------------------------------------------
-
-for result_type, gnm_input in tqdm(
-    queue,
-    desc=f"Degrees up to Nmax = {Nmax}, rank = {svd_rank}",
-    leave=False,
-):
-    sv_input = prepare_sv_input_for_dmd(
-        gnm_input,
-        truncation_degree=Nmax,
-        projection_operator=A_r_current,
-    )
-    n_physical = (
-        sv_input.shape[0]
-    )
-    n_snapshots = (
-        sv_input.shape[1]
-    )
-
-    if analysis_times_absolute.size != n_snapshots:
-        raise ValueError(
-            "Power-evaluation time count does not match the "
-            f"{result_type!r} snapshots supplied to DMD: "
-            f"{analysis_times_absolute.size} vs {n_snapshots}."
-        )
-
-    if sv_grid_weights.size != n_physical:
-        raise ValueError(
-            "Spatial power-weight count does not match the DMD "
-            f"physical dimension: {sv_grid_weights.size} vs "
-            f"{n_physical}."
-        )
-
-    if result_type == "noised" and singular_value_plot_flag:
-        (
-            perturbed_magnitude,
-            perturbed_cumulative_variance,
-        ) = calculate_pretruncation_spectrum(
+        suite = fit_candidate_suite(
             sv_input,
-            result_label="perturbed signal",
-        )
-        singular_value_magnitudes[
-            "perturbed"
-        ].append(
-            perturbed_magnitude
-        )
-        singular_value_cumulative_variance[
-            "perturbed"
-        ].append(
-            perturbed_cumulative_variance
+            selected_svd_rank,
         )
 
-    (
-        candidate_eigs,
-        candidate_modes,
-        raw_candidate_periods,
-    ) = fit_dmd_candidate_suite(
-        sv_input,
-        selected_svd_rank=svd_rank,
-    )
-
-    candidate_periods = (
-        raw_candidate_periods
-    )
-
-    # The video total follows the finite period window but deliberately retains
-    # static candidates. Keep this suite separate so the established matching
-    # and plotting behaviour of period_limit_flag is unchanged.
-    if result_type == "no_noise":
-        if period_limit_flag:
-            video_sum_candidate_keep = (
-                np.isinf(
-                    raw_candidate_periods
-                )
-                | (
-                    np.isfinite(
-                        raw_candidate_periods
-                    )
-                    & (
-                        raw_candidate_periods
-                        >= period_lower_bound
-                    )
-                    & (
-                        raw_candidate_periods
-                        <= period_upper_bound
-                    )
-                )
+        if input_label == "perturbed":
+            suites["perturbed"].append(suite)
+            singular_diagnostics["perturbed"].append(
+                calculate_singular_diagnostic(sv_input)
             )
         else:
-            video_sum_candidate_keep = np.ones(
-                raw_candidate_periods.shape,
-                dtype=bool,
-            )
+            suites[input_label] = suite
+            sv_inputs[input_label] = sv_input
+            if input_label == "ideal":
+                singular_diagnostics["ideal"] = (
+                    calculate_singular_diagnostic(sv_input)
+                )
 
-        video_sum_candidate_eigs = (
-            candidate_eigs[
-                video_sum_candidate_keep
-            ].copy()
+    recovery = {}
+    target_phasors = {}
+    for mode_number in mode_numbers:
+        source = synthetic_suite_info[mode_number]
+        target_phasor = projection_operator @ (
+            Truncate_Gauss_Coeffs(
+                source["gnm_phasor"],
+                tmax=truncation_degree,
+            ).T
         )
-        video_sum_candidate_modes = (
-            candidate_modes[
-                :,
-                video_sum_candidate_keep
-            ].copy()
+        target_phasors[mode_number] = target_phasor
+
+        recovery[mode_number] = {
+            "true_period": source["true_period"],
+            "true_eigenvalue": source["true_eigenvalue"],
+            "DMD_ideal": {},
+            "DMD": {},
+            "DMD_noised": {
+                "similarity": [],
+                "eigenvalue": [],
+                "recovered_period": [],
+            },
+        }
+
+        ideal_match = best_spatial_match(
+            suites["ideal"]["mode"],
+            suites["ideal"]["eigenvalue"],
+            suites["ideal"]["period"],
+            target_phasor,
+        )
+        if ideal_match is not None:
+            recovery[mode_number]["DMD_ideal"] = ideal_match
+
+        resolved_match = best_spatial_match(
+            suites["resolved"]["mode"],
+            suites["resolved"]["eigenvalue"],
+            suites["resolved"]["period"],
+            target_phasor,
+        )
+        if resolved_match is not None:
+            recovery[mode_number]["DMD"] = resolved_match
+
+        for perturbed_suite in suites["perturbed"]:
+            perturbed_match = best_spatial_match(
+                perturbed_suite["mode"],
+                perturbed_suite["eigenvalue"],
+                perturbed_suite["period"],
+                target_phasor,
+            )
+            if perturbed_match is not None:
+                noised_result = recovery[mode_number]["DMD_noised"]
+                noised_result["similarity"].append(
+                    perturbed_match["similarity"]
+                )
+                noised_result["eigenvalue"].append(
+                    perturbed_match["eigenvalue"]
+                )
+                noised_result["recovered_period"].append(
+                    perturbed_match["recovered_period"]
+                )
+
+    modal_results = {
+        "true": {},
+        "ideal": {
+            "period": suites["ideal"]["period"].copy(),
+            "power": suites["ideal"]["power"].copy(),
+            "matched_input_modes": candidate_matched_inputs(
+                suites["ideal"]["period"].size,
+                recovery,
+                "DMD_ideal",
+            ),
+        },
+        "resolved": {
+            "period": suites["resolved"]["period"].copy(),
+            "power": suites["resolved"]["power"].copy(),
+            "matched_input_modes": candidate_matched_inputs(
+                suites["resolved"]["period"].size,
+                recovery,
+                "DMD",
+            ),
+        },
+    }
+    for mode_number in mode_numbers:
+        source = synthetic_suite_info[mode_number]
+        modal_results["true"][mode_number] = {
+            "period": source["true_period"],
+            "power": SV_Grid_Phasor_Record_Power(
+                target_phasors[mode_number],
+                1j * source["true_eigenvalue"].imag,
+                evaluation_times=evaluation_times,
+                spatial_weights=spatial_weights,
+            ),
+        }
+
+    resolved_suite = suites["resolved"]
+    reconstruction = evaluate_candidate_sum(
+        resolved_suite["reconstruction_eigenvalue"],
+        resolved_suite["reconstruction_mode"],
+        evaluation_times,
+    )
+    resolved_input = sv_inputs["resolved"]
+    residual = reconstruction - resolved_input
+    reconstruction_metrics = {
+        "input_rms": area_weighted_rms(resolved_input),
+        "reconstruction_rms": area_weighted_rms(reconstruction),
+        "residual_rms": area_weighted_rms(residual),
+        "record_relative_rms_error": float(
+            np.sqrt(
+                np.sum(
+                    spatial_weights[:, None] * np.square(residual)
+                )
+                / np.sum(
+                    spatial_weights[:, None] * np.square(resolved_input)
+                )
+            )
+        ),
+    }
+
+    print(
+        f"Selected PyDMD rank: {selected_svd_rank}; "
+        f"effective resolved rank: "
+        f"{resolved_suite['effective_svd_rank']}; "
+        f"oscillatory candidates: {resolved_suite['period'].size}; "
+        f"static candidates: {resolved_suite['static_count']}; "
+        f"relative reconstruction RMS error: "
+        f"{reconstruction_metrics['record_relative_rms_error']:.4g}"
+    )
+
+    return {
+        "label": case_label,
+        "degree": int(truncation_degree),
+        "projection_operator": projection_operator,
+        "selected_svd_rank": selected_svd_rank,
+        "base_noise_rank": base_noise_rank,
+        "noise_threshold": noise_threshold,
+        "singular_diagnostics": singular_diagnostics,
+        "sv_inputs": sv_inputs,
+        "suites": suites,
+        "target_phasors": target_phasors,
+        "recovery": recovery,
+        "modal_results": modal_results,
+        "reconstruction": reconstruction,
+        "residual": residual,
+        "reconstruction_metrics": reconstruction_metrics,
+    }
+
+
+synthetic_degree_results = {
+    case_label: analyse_recovery_degree(case_label, degree)
+    for case_label, degree in recovery_degrees.items()
+}
+
+
+# %% ------------------------------------------------------
+# SAVE RUN MATERIALS
+# ------------------------------------------------------
+
+def degree_material_directory(result, material_name):
+    """Return and create one material directory for a degree result."""
+
+    if run_output_directory is None:
+        return None
+    material_directory = (
+        run_output_directory
+        / f"{result['label']}_N{result['degree']}"
+        / material_name
+    )
+    material_directory.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    return material_directory
+
+
+def figure_objects(figure_entry):
+    """Yield Matplotlib figures from a stored figure entry."""
+
+    if hasattr(figure_entry, "savefig"):
+        yield figure_entry
+        return
+    if (
+        isinstance(figure_entry, tuple)
+        and figure_entry
+        and hasattr(figure_entry[0], "savefig")
+    ):
+        yield figure_entry[0]
+        return
+    if isinstance(figure_entry, (tuple, list)):
+        for nested_entry in figure_entry:
+            yield from figure_objects(nested_entry)
+
+
+def save_figure_collection(result):
+    """Save every figure stored for one recovery degree."""
+
+    figure_directory = degree_material_directory(
+        result,
+        "figures",
+    )
+    if figure_directory is None:
+        return
+
+    for figure_name, figure_entry in result["figures"].items():
+        figures = list(figure_objects(figure_entry))
+        for figure_index, figure in enumerate(figures):
+            indexed_name = (
+                figure_name
+                if len(figures) == 1
+                else f"{figure_name}_{figure_index + 1:03d}"
+            )
+            for output_format in figure_output_formats:
+                figure.savefig(
+                    figure_directory
+                    / f"{indexed_name}.{output_format}",
+                    dpi=figure_output_dpi,
+                    bbox_inches="tight",
+                )
+
+
+def save_synthetic_numerical_results(result):
+    """Save the main input, candidate, matching, and reconstruction arrays."""
+
+    if not save_numerical_results:
+        return
+    numerical_directory = degree_material_directory(
+        result,
+        "numerical",
+    )
+    if numerical_directory is None:
+        return
+
+    archive = {
+        "analysis_times_absolute": analysis_times_absolute,
+        "evaluation_times": evaluation_times,
+        "resolved_input": result["sv_inputs"]["resolved"],
+        "ideal_input": result["sv_inputs"]["ideal"],
+        "reconstruction": result["reconstruction"],
+        "residual": result["residual"],
+        "input_rms": result[
+            "reconstruction_metrics"
+        ]["input_rms"],
+        "reconstruction_rms": result[
+            "reconstruction_metrics"
+        ]["reconstruction_rms"],
+        "residual_rms": result[
+            "reconstruction_metrics"
+        ]["residual_rms"],
+        "record_relative_rms_error": np.asarray(
+            result[
+                "reconstruction_metrics"
+            ]["record_relative_rms_error"]
+        ),
+        "selected_svd_rank": np.asarray(
+            result["selected_svd_rank"]
+        ),
+        "effective_resolved_svd_rank": np.asarray(
+            result["suites"]["resolved"][
+                "effective_svd_rank"
+            ]
+        ),
+        "mode_numbers": np.asarray(
+            mode_numbers,
+            dtype=str,
+        ),
+    }
+
+    for suite_name in ("ideal", "resolved"):
+        suite = result["suites"][suite_name]
+        archive[f"{suite_name}_eigenvalue"] = suite[
+            "eigenvalue"
+        ]
+        archive[f"{suite_name}_mode"] = suite["mode"]
+        archive[f"{suite_name}_period"] = suite["period"]
+        archive[f"{suite_name}_power"] = suite["power"]
+        archive[
+            f"{suite_name}_reconstruction_eigenvalue"
+        ] = suite["reconstruction_eigenvalue"]
+        archive[
+            f"{suite_name}_reconstruction_mode"
+        ] = suite["reconstruction_mode"]
+        archive[
+            f"{suite_name}_reconstruction_period"
+        ] = suite["reconstruction_period"]
+
+    for mode_number, mode_result in result["recovery"].items():
+        key_prefix = f"input_mode_{mode_number}"
+        archive[f"{key_prefix}_true_period"] = np.asarray(
+            mode_result["true_period"]
+        )
+        archive[f"{key_prefix}_true_eigenvalue"] = np.asarray(
+            mode_result["true_eigenvalue"]
+        )
+        archive[f"{key_prefix}_target_phasor"] = result[
+            "target_phasors"
+        ][mode_number]
+
+        for result_name, output_name in (
+            ("DMD_ideal", "ideal_match"),
+            ("DMD", "resolved_match"),
+        ):
+            match = mode_result[result_name]
+            archive[
+                f"{key_prefix}_{output_name}_candidate_index"
+            ] = np.asarray(
+                match.get("candidate_index", -1)
+            )
+            archive[
+                f"{key_prefix}_{output_name}_similarity"
+            ] = np.asarray(
+                match.get("similarity", np.nan)
+            )
+            archive[
+                f"{key_prefix}_{output_name}_eigenvalue"
+            ] = np.asarray(
+                match.get(
+                    "eigenvalue",
+                    np.nan + 1j * np.nan,
+                )
+            )
+            archive[
+                f"{key_prefix}_{output_name}_period"
+            ] = np.asarray(
+                match.get("recovered_period", np.nan)
+            )
+
+        noised_result = mode_result["DMD_noised"]
+        archive[
+            f"{key_prefix}_perturbed_similarity"
+        ] = np.asarray(
+            noised_result["similarity"],
+            dtype=float,
+        )
+        archive[
+            f"{key_prefix}_perturbed_eigenvalue"
+        ] = np.asarray(
+            noised_result["eigenvalue"],
+            dtype=complex,
+        )
+        archive[
+            f"{key_prefix}_perturbed_period"
+        ] = np.asarray(
+            noised_result["recovered_period"],
+            dtype=float,
         )
 
-    if period_limit_flag:
-        (
-            candidate_eigs,
-            candidate_modes,
-            candidate_periods,
-        ) = filter_candidate_period_range(
-            candidate_eigs,
-            candidate_modes,
-            candidate_periods,
-            lower_period=period_lower_bound,
-            upper_period=period_upper_bound,
-        )
+    np.savez_compressed(
+        numerical_directory / "numerical_results.npz",
+        **archive,
+    )
 
-    if degree_sweep_flag:
-        candidate_store = (
-            make_degree_sweep_candidate_store(
-                raw_candidate_periods,
-                candidate_periods,
-            )
-        )
-        degree_store = degree_sweep_results[
-            "by_degree"
-        ][int(Nmax)]
 
-        if result_type == "ideal":
-            degree_store[
-                "ideal"
-            ] = candidate_store
+def write_run_configuration():
+    """Write a human-readable record of the complete run configuration."""
 
-        elif result_type == "no_noise":
-            degree_store[
-                "resolved"
-            ] = candidate_store
+    if run_output_directory is None:
+        return
 
-        elif result_type == "noised":
-            candidate_store[
-                "realisation_index"
-            ] = int(
-                noised_realisation_index
-            )
-            degree_store[
-                "perturbed"
-            ].append(
-                candidate_store
-            )
-
-    if result_type == "noised":
-        candidate_powers = np.asarray([
-            SV_Grid_Phasor_Record_Power(
-                candidate_modes[:, candidate_index],
-                candidate_eigs[candidate_index],
-                evaluation_times=dmd_power_times,
-                spatial_weights=sv_grid_weights,
-            )
-            for candidate_index in range(
-                candidate_eigs.size
+    lines = [
+        "Synthetic flexible DMD run",
+        f"Started: {run_started_at.isoformat(timespec='seconds')}",
+        f"Algorithm: {DMD_algorithm}",
+        "",
+        "Synthetic input modes:",
+        f"Number of input modes: {len(mode_numbers)}",
+        f"Input modes: {', '.join(mode_numbers)}",
+        "",
+        "Recovery configuration:",
+        f"Low recovery degree: {low_recovery_degree}",
+        f"High recovery degree: {high_recovery_degree}",
+        f"Rank method: {svd_rank_method}",
+        f"Fixed rank setting: {fixed_svd_rank}",
+        f"Hankel embedding: {hankel_embedding_flag}",
+        f"Hankel d: {hankel_d}",
+        f"Hankel reconstruction method: {hankel_reconstruction_method}",
+        f"High-quality record: {high_q_flag}",
+        f"n_skip: {n_skip}",
+        f"Selected record start: {analysis_times_absolute[0]:.6f}",
+        f"Selected record end: {analysis_times_absolute[-1]:.6f}",
+        f"Selected snapshots: {analysis_times_absolute.size}",
+        f"Snapshot spacing (years): {dt_snapshot:.12g}",
+        "Temporal filter: none",
+        f"Plot-only period lower bound (years): "
+        f"{period_plot_lower_bound}",
+        f"Plot-only period upper bound (years): "
+        f"{period_plot_upper_bound}",
+        f"Ensemble enabled: {ensemble_flag}",
+        f"Ensemble realisations: {n_realisations}",
+        f"Noise rank realisations: {n_noise_rank_realisations}",
+        f"Noise rank quantile: {noise_rank_quantile}",
+        f"Noise temporal model: {noise_temporal_model}",
+        f"Noise tau (years): {noise_tau_years}",
+        f"Figure formats: {', '.join(figure_output_formats)}",
+        f"Figure dpi: {figure_output_dpi}",
+        f"Videos enabled: {video_plot}",
+        "",
+        "Degree-specific results:",
+    ]
+    for result in synthetic_degree_results.values():
+        lines.extend([
+            (
+                f"{result['label']} n<={result['degree']}: "
+                f"selected rank={result['selected_svd_rank']}, "
+                "effective resolved rank="
+                f"{result['suites']['resolved']['effective_svd_rank']}, "
+                "oscillatory candidates="
+                f"{result['suites']['resolved']['period'].size}, "
+                "static candidates="
+                f"{result['suites']['resolved']['static_count']}, "
+                "relative reconstruction RMS error="
+                f"{result['reconstruction_metrics']['record_relative_rms_error']:.12g}"
             )
         ])
 
-        ensemble_candidate_modal_power_results[
-            "recovered_period"
-        ].extend(
-            candidate_periods.tolist()
-        )
-        ensemble_candidate_modal_power_results[
-            "recovered_power"
-        ].extend(
-            candidate_powers.tolist()
-        )
-        ensemble_candidate_modal_power_results[
-            "realisation_index"
-        ].extend(
-            [
-                noised_realisation_index
-            ]
-            * candidate_eigs.size
-        )
-        noised_realisation_index += 1
-
-    # candidates found, store for no perturbation case
-    if result_type == "no_noise":
-
-        clean_candidate_eigs = (
-            candidate_eigs.copy()
-        )
-
-        clean_candidate_modes = (
-            candidate_modes.copy()
-        )
-
-        clean_candidate_periods = (
-            candidate_periods.copy()
-        )
-
-    elif result_type == "ideal":
-
-        ideal_candidate_eigs = (
-            candidate_eigs.copy()
-        )
-
-        ideal_candidate_modes = (
-            candidate_modes.copy()
-        )
-
-        ideal_candidate_periods = (
-            candidate_periods.copy()
-        )
+    (
+        run_output_directory / "run_configuration.txt"
+    ).write_text(
+        "\n".join(lines) + "\n",
+        encoding="utf-8",
+    )
 
 
-    # ---------------------------------------------
-    # MATCH TO EVERY KNOWN INPUT MODE
-    # ---------------------------------------------
+write_run_configuration()
 
-    for mode_number in matching_mode_numbers:
-
-        match = best_spatial_match(
-            candidate_modes=candidate_modes,
-            candidate_eigs=candidate_eigs,
-            candidate_periods=candidate_periods,
-            target_phasor=target_phasors[
-                mode_number
-            ],
-        )
-
-        # No eligible physical candidate / no finite similarity.
-        if match is None:
-            continue
-
-        if result_type == "no_noise":
-
-            DMD_recovery[
-                mode_number
-            ]["DMD"]= {
-                **match,
-                "degree_max": Nmax,
-            }
-
-        elif result_type == "ideal":
-
-            DMD_recovery[
-                mode_number
-            ]["DMD_ideal"] = {
-                **match,
-                "degree_max": Nmax,
-            }
-
-        elif result_type == "noised":
-
-            noised_store = (
-                DMD_recovery[
-                    mode_number
-                ]["DMD_noised"]
-            )
-
-            noised_store[
-                "similarity"
-            ].append(
-                match["similarity"]
-            )
-
-            noised_store[
-                "eigenvalue"
-            ].append(
-                match["eigenvalue"]
-            )
-
-            noised_store[
-                "recovered_period"
-            ].append(
-                match["recovered_period"]
-            )
-
-        else:
-            raise ValueError(
-                f"Unknown DMD result type: {result_type}"
-            )
 
 # %% ------------------------------------------------------
-# STORE TRUE / IDEAL / RESOLVED MODAL POWER RESULTS
+# DIAGNOSTIC PLOTS
 # ------------------------------------------------------
 
-modal_power_results = {
-    "metadata": {
-        "DMD_algorithm": DMD_algorithm,
-        "svd_rank_selection": (
-            "number of clean resolved singular values strictly "
-            "greater than the selected quantile of noise-only "
-            "leading singular values"
-        ),
-        "svd_rank": int(
-            svd_rank
-        ),
-        "noise_rank_quantile": float(
-            noise_rank_quantile
-        ),
-        "noise_rank_realisations": int(
-            n_noise_rank_realisations
-        ),
-        "noise_singular_value_threshold": float(
-            noise_singular_value_threshold
-        ),
-        "period_limit_enabled": bool(
-            period_limit_flag
-        ),
-        "period_lower_bound": (
-            float(period_lower_bound)
-            if period_limit_flag
-            else None
-        ),
-        "period_upper_bound": (
-            float(period_upper_bound)
-            if period_limit_flag
-            else None
-        ),
-        "hankel_embedding": bool(
-            hankel_embedding_flag
-        ),
-        "hankel_d": (
-            int(hankel_d)
-            if hankel_embedding_flag
-            else None
-        ),
-        "analysis_times_absolute": (
-            analysis_times_absolute.copy()
-        ),
-        "truth_reference_year": float(
-            times_absolute[0]
-        ),
-        "dmd_reference_year": float(
-            analysis_times_absolute[0]
-        ),
-        "power_definition": (
-            "time mean of the area-weighted spatial mean square "
-            "of Re[phasor * exp(eigenvalue * relative_time)]"
-        ),
-    },
-    "true": {},
-    "ideal": {},
-    "resolved": {},
-}
-
-for mode_number in matching_mode_numbers:
-
-    true_eigenvalue = synthetic_suite_info[
-        mode_number
-    ]["true_eigenvalue"]
-
-    true_phasor = target_phasors[
-        mode_number
-    ]
-
-    modal_power_results[
-        "true"
-    ][mode_number] = {
-        "eigenvalue": true_eigenvalue,
-        "period": synthetic_suite_info[
-            mode_number
-        ]["true_period"],
-        "power": SV_Grid_Phasor_Record_Power(
-            true_phasor,
-            true_eigenvalue,
-            evaluation_times=truth_power_times,
-            spatial_weights=sv_grid_weights,
-        ),
-        "quality_factor": Mode_Quality_Factor(
-            [true_eigenvalue]
-        )[0],
-    }
-
-for (
-    result_name,
-    candidate_eigs_store,
-    candidate_modes_store,
-    candidate_periods_store,
-    match_key,
-) in (
-    (
-        "ideal",
-        ideal_candidate_eigs,
-        ideal_candidate_modes,
-        ideal_candidate_periods,
-        "DMD_ideal",
-    ),
-    (
-        "resolved",
-        clean_candidate_eigs,
-        clean_candidate_modes,
-        clean_candidate_periods,
-        "DMD",
-    ),
-):
-
-    if (
-        candidate_eigs_store is None
-        or candidate_modes_store is None
-        or candidate_periods_store is None
-    ):
-        raise RuntimeError(
-            f"Missing cached {result_name} DMD candidate suite."
-        )
-
-    matched_input_modes = [
-        []
-        for _ in range(
-            candidate_eigs_store.size
-        )
-    ]
-
-    for mode_number in matching_mode_numbers:
-        candidate_index = DMD_recovery[
-            mode_number
-        ].get(
-            match_key,
-            {},
-        ).get(
-            "candidate_index"
-        )
-
-        if candidate_index is None:
-            continue
-
-        candidate_index = int(
-            candidate_index
-        )
-
-        if not (
-            0
-            <= candidate_index
-            < candidate_eigs_store.size
-        ):
-            raise IndexError(
-                f"{result_name} candidate index "
-                f"{candidate_index} is outside the retained "
-                f"candidate set of size "
-                f"{candidate_eigs_store.size}."
-            )
-
-        matched_input_modes[
-            candidate_index
-        ].append(
-            mode_number
-        )
-
-    candidate_powers = np.asarray([
-        SV_Grid_Phasor_Record_Power(
-            candidate_modes_store[:, idx],
-            candidate_eigs_store[idx],
-            evaluation_times=dmd_power_times,
-            spatial_weights=sv_grid_weights,
-        )
-        for idx in range(
-            candidate_eigs_store.size
-        )
-    ])
-
-    spatial_similarity = np.empty(
-        (
-            candidate_eigs_store.size,
-            len(matching_mode_numbers),
-        ),
-        dtype=float,
-    )
-
-    for candidate_idx in range(
-        candidate_eigs_store.size
-    ):
-        for input_idx, mode_number in enumerate(
-            matching_mode_numbers
-        ):
-            spatial_similarity[
-                candidate_idx,
-                input_idx,
-            ] = Complex_Phasor_Compare(
-                candidate_modes_store[
-                    :,
-                    candidate_idx,
-                ],
-                target_phasors[
-                    mode_number
-                ],
-            )
-
-    modal_power_results[
-        result_name
-    ] = {
-        "eigenvalue": candidate_eigs_store.copy(),
-        "period": candidate_periods_store.copy(),
-        "power": candidate_powers,
-        "quality_factor": Mode_Quality_Factor(
-            candidate_eigs_store
-        ),
-        "matched_input_modes": matched_input_modes,
-        "input_mode_numbers": matching_mode_numbers.copy(),
-        "spatial_similarity": spatial_similarity,
-    }
-
-
-def plot_ensemble_candidate_period_power(
-    results,
-    figsize=(9, 6),
-):
-    """
-    Plot all perturbed-ensemble DMD candidates without mode matching.
-
-    True inputs are shown for reference. Recovered candidates are treated as
-    one population irrespective of their spatial similarity to any input.
-    """
-
-    true_periods = np.asarray(
-        results[
-            "true_period"
-        ],
-        dtype=float,
-    )
-    true_powers = np.asarray(
-        results[
-            "true_power"
-        ],
-        dtype=float,
-    )
-    recovered_periods = np.asarray(
-        results[
-            "recovered_period"
-        ],
-        dtype=float,
-    )
-    recovered_powers = np.asarray(
-        results[
-            "recovered_power"
-        ],
-        dtype=float,
-    )
-    realisation_indices = np.asarray(
-        results[
-            "realisation_index"
-        ],
-        dtype=int,
-    )
-
-    if true_periods.size != true_powers.size:
-        raise ValueError(
-            "True period and power arrays must have equal lengths."
-        )
-
-    if not (
-        recovered_periods.size
-        == recovered_powers.size
-        == realisation_indices.size
-    ):
-        raise ValueError(
-            "Recovered period, power, and realisation-index arrays "
-            "must have equal lengths."
-        )
-
-    true_valid = (
-        np.isfinite(
-            true_periods
-        )
-        & (
-            true_periods > 0.0
-        )
-        & np.isfinite(
-            true_powers
-        )
-        & (
-            true_powers > 0.0
-        )
-    )
-
-    recovered_valid = (
-        np.isfinite(
-            recovered_periods
-        )
-        & (
-            recovered_periods > 0.0
-        )
-        & np.isfinite(
-            recovered_powers
-        )
-        & (
-            recovered_powers > 0.0
-        )
-    )
-
-    if period_limit_flag:
-        recovered_valid &= (
-            recovered_periods
-            >= period_lower_bound
-        ) & (
-            recovered_periods
-            <= period_upper_bound
-        )
-
+def plot_singular_diagnostic(result):
+    diagnostics = result["singular_diagnostics"]
     fig, ax = plt.subplots(
-        figsize=figsize
+        figsize=(text_width, 0.48 * text_width),
     )
-
-    ax.scatter(
-        true_periods[
-            true_valid
-        ],
-        true_powers[
-            true_valid
-        ],
-        marker="o",
-        s=60,
-        facecolor="0.65",
-        edgecolor="0.3",
-        linewidth=0.8,
-        alpha=0.9,
-        label="True inputs",
-        zorder=5,
+    categories = (
+        ("ideal", "Ideal", "tab:blue"),
+        ("resolved", "Resolved", "tab:orange"),
     )
+    for key, label, colour in categories:
+        diagnostic = diagnostics[key]
+        if diagnostic is None:
+            continue
+        indices = np.arange(1, diagnostic["magnitude"].size + 1)
+        ax.plot(
+            indices,
+            diagnostic["magnitude"],
+            label=label,
+            color=colour,
+        )
 
-    if np.any(
-        recovered_valid
+    for noise_index, diagnostic in enumerate(
+        diagnostics["noise_only"]
     ):
-        ax.scatter(
-            recovered_periods[
-                recovered_valid
-            ],
-            recovered_powers[
-                recovered_valid
-            ],
-            marker=".",
-            s=20,
+        indices = np.arange(1, diagnostic["magnitude"].size + 1)
+        ax.plot(
+            indices,
+            diagnostic["magnitude"],
             color="tab:purple",
-            edgecolors="none",
-            alpha=0.3,
+            alpha=0.45,
             label=(
-                "All perturbed-ensemble "
-                "recovered modes"
-            ),
-            rasterized=True,
-            zorder=2,
-        )
-
-    ax.set_xscale(
-        "log"
-    )
-    ax.set_yscale(
-        "log"
-    )
-    ax.set_xlabel(
-        "Period (years)"
-    )
-    ax.set_ylabel(
-        r"Record-mean area-weighted SV power "
-        r"[(nT/yr)$^2$]"
-    )
-    ax.set_title(
-        "Perturbed-ensemble DMD candidate population\n"
-        "all recovered modes shown without input matching"
-    )
-    ax.grid(
-        alpha=0.25,
-        which="both",
-    )
-    ax.legend(
-        loc="best"
-    )
-    fig.tight_layout()
-
-    return fig, ax
-
-
-def plot_degree_sweep_recovered_periods(
-    results,
-    true_periods,
-    figsize=(10, 12),
-):
-    """Plot every finite recovered period in three aligned sweep panels."""
-
-    degrees = np.asarray(
-        results[
-            "degree_truncations"
-        ],
-        dtype=int,
-    )
-    true_periods = np.asarray(
-        true_periods,
-        dtype=float,
-    )
-    true_periods = np.unique(
-        true_periods[
-            np.isfinite(
-                true_periods
-            )
-            & (
-                true_periods > 0.0
-            )
-        ]
-    )
-
-    panel_definitions = (
-        (
-            "ideal",
-            "Ideal (no resolution mapping)",
-            "tab:blue",
-            "o",
-        ),
-        (
-            "resolved",
-            "Resolved (resolution mapping applied)",
-            "tab:orange",
-            "x",
-        ),
-        (
-            "perturbed",
-            "Perturbed ensemble",
-            "tab:green",
-            ".",
-        ),
-    )
-
-    fig, axes = plt.subplots(
-        nrows=3,
-        ncols=1,
-        figsize=figsize,
-        sharex=True,
-        sharey=True,
-    )
-
-    for (
-        ax,
-        (
-            result_key,
-            panel_title,
-            color,
-            marker,
-        ),
-    ) in zip(
-        axes,
-        panel_definitions,
-    ):
-        true_label_used = False
-
-        for true_period in true_periods:
-            ax.axvline(
-                true_period,
-                color="0.45",
-                linestyle="--",
-                linewidth=0.9,
-                alpha=0.55,
-                label=(
-                    "True input periods"
-                    if not true_label_used
-                    else None
-                ),
-                zorder=1,
-            )
-            true_label_used = True
-
-        recovered_label_used = False
-
-        for degree in degrees:
-            degree_store = results[
-                "by_degree"
-            ][int(degree)]
-
-            if result_key == "perturbed":
-                candidate_stores = degree_store[
-                    "perturbed"
-                ]
-            else:
-                candidate_store = degree_store[
-                    result_key
-                ]
-                candidate_stores = (
-                    []
-                    if candidate_store is None
-                    else [candidate_store]
-                )
-
-            for candidate_store in candidate_stores:
-                periods = np.asarray(
-                    candidate_store[
-                        "recovered_period"
-                    ],
-                    dtype=float,
-                )
-                finite_periods = periods[
-                    np.isfinite(
-                        periods
-                    )
-                    & (
-                        periods > 0.0
-                    )
-                ]
-
-                if finite_periods.size == 0:
-                    continue
-
-                ax.scatter(
-                    finite_periods,
-                    np.full(
-                        finite_periods.size,
-                        degree,
-                        dtype=float,
-                    ),
-                    color=color,
-                    marker=marker,
-                    s=(
-                        28
-                        if result_key != "perturbed"
-                        else 18
-                    ),
-                    linewidths=(
-                        1.0
-                        if marker == "x"
-                        else None
-                    ),
-                    edgecolors=(
-                        "none"
-                        if marker == "."
-                        else None
-                    ),
-                    alpha=(
-                        0.8
-                        if result_key != "perturbed"
-                        else 0.28
-                    ),
-                    label=(
-                        "Recovered modes"
-                        if not recovered_label_used
-                        else None
-                    ),
-                    rasterized=(
-                        result_key == "perturbed"
-                    ),
-                    zorder=3,
-                )
-                recovered_label_used = True
-
-        if (
-            result_key == "perturbed"
-            and not results[
-                "metadata"
-            ][
-                "ensemble_enabled"
-            ]
-        ):
-            ax.text(
-                0.5,
-                0.5,
-                "Perturbation ensemble disabled",
-                transform=ax.transAxes,
-                ha="center",
-                va="center",
-                color="0.4",
-            )
-
-        ax.set_title(
-            panel_title
-        )
-        ax.set_ylabel(
-            "Truncation degree n"
-        )
-        ax.set_yticks(
-            degrees
-        )
-        ax.grid(
-            alpha=0.25,
-            which="both",
-        )
-        ax.legend(
-            loc="best"
-        )
-
-    axes[-1].set_xscale(
-        "log"
-    )
-    axes[-1].set_xlabel(
-        "Recovered period (years)"
-    )
-
-    if period_limit_flag:
-        axes[-1].set_xlim(
-            period_lower_bound,
-            period_upper_bound,
-        )
-
-    fig.suptitle(
-        "Recovered DMD periods across cumulative "
-        "spherical-harmonic degree truncations"
-    )
-    fig.tight_layout()
-
-    return fig, axes
-
-
-def plot_degree_sweep_static_counts(
-    results,
-    figsize=(9, 6),
-):
-    """Plot counts of raw infinite-period candidates at every degree."""
-
-    degrees = np.asarray(
-        results[
-            "degree_truncations"
-        ],
-        dtype=int,
-    )
-
-    ideal_counts = []
-    resolved_counts = []
-
-    for degree in degrees:
-        degree_store = results[
-            "by_degree"
-        ][int(degree)]
-
-        ideal_counts.append(
-            degree_store[
-                "ideal"
-            ][
-                "static_recovered_period"
-            ].size
-        )
-        resolved_counts.append(
-            degree_store[
-                "resolved"
-            ][
-                "static_recovered_period"
-            ].size
-        )
-
-    fig, ax = plt.subplots(
-        figsize=figsize
-    )
-
-    ax.plot(
-        degrees,
-        ideal_counts,
-        color="tab:blue",
-        marker="o",
-        linewidth=1.8,
-        label="Ideal",
-        zorder=5,
-    )
-    ax.plot(
-        degrees,
-        resolved_counts,
-        color="tab:orange",
-        marker="x",
-        linewidth=1.8,
-        label="Resolved",
-        zorder=6,
-    )
-
-    perturbed_label_used = False
-    perturbed_median = []
-
-    for degree in degrees:
-        perturbed_stores = results[
-            "by_degree"
-        ][int(degree)][
-            "perturbed"
-        ]
-        perturbed_counts = np.asarray([
-            candidate_store[
-                "static_recovered_period"
-            ].size
-            for candidate_store in perturbed_stores
-        ], dtype=float)
-
-        if perturbed_counts.size == 0:
-            perturbed_median.append(
-                np.nan
-            )
-            continue
-
-        ax.scatter(
-            np.full(
-                perturbed_counts.size,
-                degree,
-                dtype=float,
-            ),
-            perturbed_counts,
-            color="tab:green",
-            marker=".",
-            s=28,
-            alpha=0.3,
-            label=(
-                "Perturbed realisations"
-                if not perturbed_label_used
+                "Noise-only spectrum"
+                if noise_index == 0
                 else None
             ),
-            zorder=2,
-        )
-        perturbed_label_used = True
-        perturbed_median.append(
-            np.median(
-                perturbed_counts
-            )
         )
 
-    perturbed_median = np.asarray(
-        perturbed_median,
-        dtype=float,
-    )
-    finite_median = np.isfinite(
-        perturbed_median
-    )
-
-    if np.any(
-        finite_median
-    ):
-        ax.plot(
-            degrees[
-                finite_median
-            ],
-            perturbed_median[
-                finite_median
-            ],
-            color="tab:green",
-            marker="s",
-            linewidth=1.8,
-            label="Perturbed median",
-            zorder=4,
+    rank = result["selected_svd_rank"]
+    if isinstance(rank, (int, np.integer)) and rank > 0:
+        ax.axvline(
+            rank,
+            color="black",
+            linestyle="-.",
+            linewidth=1.0,
+            label="Selected rank",
+        )
+    threshold = result["noise_threshold"]
+    if threshold is not None:
+        ax.axhline(
+            threshold,
+            color="tab:red",
+            linestyle="--",
+            label="Noise threshold",
         )
 
-    ax.set_xlabel(
-        "Cumulative spherical-harmonic truncation degree n"
-    )
-    ax.set_ylabel(
-        "Number of recovered static modes"
-    )
-    ax.set_xticks(
-        degrees
-    )
-    ax.yaxis.set_major_locator(
-        MaxNLocator(
-            integer=True
-        )
-    )
+    ax.set_yscale("log")
+    ax.set_xlabel("Singular-value index")
+    ax.set_ylabel("Singular-value magnitude")
+    ax.legend(loc="lower right")
     ax.set_title(
-        "Infinite-period DMD recovery across degree truncations"
-    )
-    ax.grid(
-        alpha=0.25
-    )
-    ax.legend(
-        loc="best"
+        f"{result['label'].capitalize()} recovery SVD diagnostics "
+        f"(n <= {result['degree']})"
     )
     fig.tight_layout()
-
     return fig, ax
 
 
-def plot_degree_sweep_svd_rank(
-    results,
-    figsize=(8, 5.5),
-):
-    """Plot the independently selected noise-threshold rank by degree."""
+def matched_candidate_indices(result):
+    """Return resolved candidates selected by at least one synthetic input."""
 
-    degrees = np.asarray(
-        results[
-            "degree_truncations"
-        ],
+    return np.asarray(
+        sorted({
+            int(mode_result["DMD"]["candidate_index"])
+            for mode_result in result["recovery"].values()
+            if "candidate_index" in mode_result["DMD"]
+        }),
         dtype=int,
     )
-    ranks = np.asarray([
-        results[
-            "by_degree"
-        ][int(degree)][
-            "svd_rank"
-        ]
-        for degree in degrees
-    ], dtype=int)
+
+
+def period_view_title(view_label):
+    if view_label == "zoom":
+        return (
+            f"{period_plot_lower_bound:g}-"
+            f"{period_plot_upper_bound:g} year view"
+        )
+    return "full period range"
+
+
+def plot_candidate_eigenvalue_recovery(
+    result,
+    period_limits,
+    view_label,
+):
+    """Plot every resolved candidate using matched/unmatched colours."""
+
+    suite = result["suites"]["resolved"]
+    candidate_indices = np.arange(suite["period"].size)
+    matched_indices = matched_candidate_indices(result)
+    matched = np.isin(candidate_indices, matched_indices)
 
     fig, ax = plt.subplots(
-        figsize=figsize
+        figsize=(text_width, 0.72 * text_width)
     )
-    ax.plot(
-        degrees,
-        ranks,
-        color="tab:purple",
+    true_periods = np.asarray([
+        mode_result["true_period"]
+        for mode_result in result["recovery"].values()
+    ])
+    true_growth = np.asarray([
+        complex(mode_result["true_eigenvalue"]).real
+        for mode_result in result["recovery"].values()
+    ])
+    ax.scatter(
+        true_periods,
+        true_growth,
         marker="o",
-        linewidth=1.8,
+        facecolors="none",
+        edgecolors="black",
+        linewidths=1.5,
+        s=65,
+        label="True input",
+        zorder=5,
     )
-    ax.set_xlabel(
-        "Cumulative spherical-harmonic truncation degree n"
-    )
-    ax.set_ylabel(
-        "Selected SVD rank"
-    )
-    ax.set_xticks(
-        degrees
-    )
-    ax.yaxis.set_major_locator(
-        MaxNLocator(
-            integer=True
+    if np.any(matched):
+        ax.scatter(
+            suite["period"][matched],
+            suite["eigenvalue"][matched].real,
+            marker="x",
+            color="green",
+            linewidths=1.8,
+            s=65,
+            label="Matched DMD candidate",
+            zorder=4,
         )
-    )
-    ax.set_title(
-        "Noise-threshold SVD rank selected independently "
-        "at each degree truncation"
-    )
-    ax.grid(
-        alpha=0.25
-    )
-    fig.tight_layout()
+    if np.any(~matched):
+        ax.scatter(
+            suite["period"][~matched],
+            suite["eigenvalue"][~matched].real,
+            marker="x",
+            color="red",
+            linewidths=1.8,
+            s=65,
+            label="Unmatched DMD candidate",
+            zorder=3,
+        )
 
+    ax.set_xscale("log")
+    ax.set_xlim(*period_limits)
+    ax.axhline(0.0, color="0.5", linewidth=0.8)
+    ax.set_xlabel("Period (years)")
+    ax.set_ylabel(r"Growth/decay rate $\sigma$ (yr$^{-1}$)")
+    ax.set_title(
+        f"{result['label'].capitalize()} recovery continuous eigenvalues "
+        f"(n <= {result['degree']}; {period_view_title(view_label)})"
+    )
+    ax.grid(alpha=0.25, which="both")
+    ax.legend()
+    fig.tight_layout()
     return fig, ax
 
 
-# %% video creation
-if video_plot:
-    video_data = prepare_recovery_video_data(
+def plot_candidate_similarity_recovery(
+    result,
+    period_limits,
+    view_label,
+):
+    """Show match similarities and every resolved candidate period."""
 
-        # Restrict the exact and resolved truth rows to the same active true
-        # period window used by the recovery diagnostics.
-        mode_numbers=matching_mode_numbers,
+    suite = result["suites"]["resolved"]
+    candidate_indices = np.arange(suite["period"].size)
+    matched_indices = matched_candidate_indices(result)
+    matched = np.isin(candidate_indices, matched_indices)
 
-        DMD_recovery=DMD_recovery,
-
-        synthetic_suite_info=
-            synthetic_suite_info,
-
-        target_phasors=
-            target_phasors,
-
-        clean_candidate_eigs=
-            clean_candidate_eigs,
-
-        clean_candidate_modes=
-            clean_candidate_modes,
-
-        recovered_sum_candidate_eigs=
-            video_sum_candidate_eigs,
-
-        recovered_sum_candidate_modes=
-            video_sum_candidate_modes,
-
-        A_r_current=
-            A_r_current,
-
-        # Absolute decimal-year vector corresponding exactly to the
-        # rows of gnm_total_res. The synthetic series starts at 1997.1.
-        model_time_years=
-            times_absolute,
-
-        dt_years=
-            dt_years,
-
-        Nmax=
-            Nmax,
-
-        truncate_gauss_coeffs=
-            Truncate_Gauss_Coeffs,
-
-        high_q_flag=
-            high_q_flag,
-
-        good_record_slice=
-            good_record_slice,
-
-        # IMPORTANT:
-        # Must be the same t=0 phase origin used when the synthetic
-        # R_splines_arbitrary.h5 series were originally generated.
-        #
-        # The synthetic phase origin is the first sample at 1997.1.
-        truth_t0_year=
-            times_absolute[0],
-
-        # Your HDF5 dataset is explicitly called "without_decay",
-        # so this should normally remain False.
-        truth_include_growth=
-            False,
-
-        # One video frame at every 0.2-year source sample.
-        frame_spacing_years=
-            0.2,
+    fig, ax = plt.subplots(
+        figsize=(text_width, 0.72 * text_width)
+    )
+    true_periods = np.asarray([
+        mode_result["true_period"]
+        for mode_result in result["recovery"].values()
+    ])
+    ax.scatter(
+        true_periods,
+        np.ones(true_periods.size),
+        marker="o",
+        facecolors="none",
+        edgecolors="black",
+        linewidths=1.5,
+        s=65,
+        label="True input",
+        zorder=5,
     )
 
-    nlon = 360
-    nlat = n_physical // nlon
-
-    assert (
-        nlat * nlon
-        == n_physical
-    )
-
-    output_path = make_dmd_recovery_video(
-
-        video_data=
-            video_data,
-
-        output_path=
-            PROJECT_ROOT
-            / "outputs"
-            / (
-                f"{DMD_algorithm}"
-                + (
-                    f"_hankel_d{hankel_d}"
-                    if hankel_embedding_flag
-                    else ""
-                )
-                + "_recovery_video.mp4"
+    for line_index, period in enumerate(
+        suite["period"][matched]
+    ):
+        ax.axvline(
+            period,
+            color="green",
+            linestyle="--",
+            linewidth=1.0,
+            alpha=0.55,
+            label=(
+                "Matched candidate period"
+                if line_index == 0
+                else None
             ),
+        )
+    for line_index, period in enumerate(
+        suite["period"][~matched]
+    ):
+        ax.axvline(
+            period,
+            color="red",
+            linestyle="--",
+            linewidth=1.0,
+            alpha=0.4,
+            label=(
+                "Unmatched candidate period"
+                if line_index == 0
+                else None
+            ),
+        )
 
-        DMD_algorithm=
-            DMD_algorithm,
+    matched_periods = []
+    matched_similarities = []
+    for mode_result in result["recovery"].values():
+        match = mode_result["DMD"]
+        if "candidate_index" not in match:
+            continue
+        matched_periods.append(match["recovered_period"])
+        matched_similarities.append(match["similarity"])
+    if matched_periods:
+        ax.scatter(
+            matched_periods,
+            matched_similarities,
+            marker="x",
+            color="green",
+            linewidths=1.8,
+            s=65,
+            label="Matched output similarity",
+            zorder=6,
+        )
 
-        Nmax=
-            Nmax,
+    ax.set_xscale("log")
+    ax.set_xlim(*period_limits)
+    ax.set_ylim(0.0, 1.03)
+    ax.set_xlabel("Recovered period (years)")
+    ax.set_ylabel("Complex spatial-phasor similarity")
+    ax.set_title(
+        f"{result['label'].capitalize()} recovery period and similarity "
+        f"(n <= {result['degree']}; {period_view_title(view_label)})"
+    )
+    ax.grid(alpha=0.25, which="both")
+    ax.legend()
+    fig.tight_layout()
+    return fig, ax
 
-        svd_rank=
-            svd_rank,
 
-        nlat=
-            nlat,
+def plot_reconstruction_diagnostic(result):
+    metrics = result["reconstruction_metrics"]
+    fig, ax = plt.subplots(
+        figsize=(text_width, 0.48 * text_width)
+    )
+    ax.plot(
+        analysis_times_absolute,
+        metrics["input_rms"],
+        label="Resolved synthetic input",
+        color="black",
+    )
+    ax.plot(
+        analysis_times_absolute,
+        metrics["reconstruction_rms"],
+        label="DMD reconstruction (all recovered modes)",
+        color="tab:blue",
+    )
+    ax.plot(
+        analysis_times_absolute,
+        metrics["residual_rms"],
+        label="Reconstruction - input",
+        color="tab:red",
+    )
+    ax.set_xlabel("Decimal year")
+    ax.set_ylabel("Area-weighted spatial RMS (nT/yr)")
+    ax.set_title(
+        f"{result['label'].capitalize()} recovery signal reconstruction "
+        f"(n <= {result['degree']}; relative RMS error "
+        f"{metrics['record_relative_rms_error']:.3g})"
+    )
+    ax.grid(alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    return fig, ax
 
-        nlon=
-            nlon,
 
-        hankel_embedding_d=(
-            hankel_d
-            if hankel_embedding_flag
-            else None
+for result in synthetic_degree_results.values():
+    full_period_limits = finite_period_limits(
+        result["recovery"],
+        (
+            result["suites"]["ideal"],
+            result["suites"]["resolved"],
         ),
-
-        high_q_flag=
-            high_q_flag,
-
-        n_skip=
-            n_skip,
-
-        # Requested settings
-        fps=5,
-        cmap="seismic",
-
-        dpi=100,
+    )
+    zoom_period_limits = (
+        period_plot_lower_bound,
+        period_plot_upper_bound,
     )
 
-# %% plotting results
+    figures = {}
+    figures["period_power_full"] = plot_modal_period_power(
+        result["modal_results"],
+        figsize=(text_width, 0.72 * text_width),
+        show_ideal=show_ideal_all_modes,
+        period_xlim=full_period_limits,
+    )
+    figures["period_power_zoom"] = plot_modal_period_power(
+        result["modal_results"],
+        figsize=(text_width, 0.72 * text_width),
+        show_ideal=show_ideal_all_modes,
+        period_xlim=zoom_period_limits,
+    )
+    figures["period_power_full"][1].set_title(
+        f"{result['label'].capitalize()} recovery retained-mode "
+        f"period and power (n <= {result['degree']}; full period range)"
+    )
+    figures["period_power_zoom"][1].set_title(
+        f"{result['label'].capitalize()} recovery retained-mode "
+        f"period and power (n <= {result['degree']}; "
+        f"{period_view_title('zoom')})"
+    )
+    figures["period_power_full"][0].tight_layout()
+    figures["period_power_zoom"][0].tight_layout()
 
-if period_limit_flag:
-    plot_lower_lim_yr = (
-        period_lower_bound - 1.0
-    )
-    plot_upper_lim_yr = (
-        period_upper_bound + 1.0
-    )
-    modal_period_xlim = (
-        plot_lower_lim_yr,
-        plot_upper_lim_yr,
-    )
-else:
-    plot_lower_lim_yr = 1.0
-    plot_upper_lim_yr = up_lim_yr_plot
-    modal_period_xlim = None
+    for view_label, limits in (
+        ("full", full_period_limits),
+        ("zoom", zoom_period_limits),
+    ):
+        figures[f"eigenvalue_{view_label}"] = (
+            plot_candidate_eigenvalue_recovery(
+                result,
+                limits,
+                view_label,
+            )
+        )
+        figures[f"similarity_{view_label}"] = (
+            plot_candidate_similarity_recovery(
+                result,
+                limits,
+                view_label,
+            )
+        )
 
-DMD_recovery_plot = {
-    mode_number: DMD_recovery[
-        mode_number
-    ]
-    for mode_number in matching_mode_numbers
+    figures["svd"] = plot_singular_diagnostic(result)
+    figures["reconstruction"] = plot_reconstruction_diagnostic(result)
+    result["figures"] = figures
+    save_figure_collection(result)
+    save_synthetic_numerical_results(result)
+
+if show_figures_interactively:
+    plt.show(block=False)
+    plt.pause(0.1)
+
+
+# %% ------------------------------------------------------
+# DEGREE-SPECIFIC RECOVERY VIDEOS
+# ------------------------------------------------------
+
+if video_plot:
+    for result in synthetic_degree_results.values():
+        output_directory = degree_material_directory(
+            result,
+            "videos",
+        )
+        if output_directory is None:
+            output_directory = PROJECT_ROOT / "outputs"
+            output_directory.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+        resolved_suite = result["suites"]["resolved"]
+        video_data = prepare_recovery_video_data(
+            mode_numbers=mode_numbers,
+            DMD_recovery=result["recovery"],
+            synthetic_suite_info=synthetic_suite_info,
+            target_phasors=result["target_phasors"],
+            clean_candidate_eigs=resolved_suite["eigenvalue"],
+            clean_candidate_modes=resolved_suite["mode"],
+            clean_candidate_ids=resolved_suite["candidate_id"],
+            recovered_sum_candidate_eigs=(
+                resolved_suite["reconstruction_eigenvalue"]
+            ),
+            recovered_sum_candidate_modes=(
+                resolved_suite["reconstruction_mode"]
+            ),
+            recovered_sum_candidate_ids=(
+                resolved_suite["reconstruction_candidate_id"]
+            ),
+            A_r_current=result["projection_operator"],
+            model_time_years=times_absolute,
+            dt_years=dt_years,
+            Nmax=result["degree"],
+            truncate_gauss_coeffs=Truncate_Gauss_Coeffs,
+            high_q_flag=high_q_flag,
+            good_record_slice=good_record_slice,
+            truth_t0_year=times_absolute[0],
+            truth_include_growth=False,
+            frame_spacing_years=video_frame_spacing_years,
+            compact_input_threshold=video_compact_input_threshold,
+        )
+
+        video_path = output_directory / (
+            f"{DMD_algorithm}_"
+            f"{result['label']}_N{result['degree']}_"
+            "all_recovered_modes.mp4"
+        )
+        result["video_output_path"] = make_dmd_recovery_video(
+            video_data=video_data,
+            output_path=video_path,
+            DMD_algorithm=DMD_algorithm,
+            Nmax=result["degree"],
+            svd_rank=resolved_suite["effective_svd_rank"],
+            nlat=state_shape[0],
+            nlon=state_shape[1],
+            hankel_embedding_d=(
+                hankel_d if hankel_embedding_flag else None
+            ),
+            high_q_flag=high_q_flag,
+            n_skip=n_skip,
+            fps=video_fps,
+            cmap="seismic",
+            dpi=100,
+        )
+
+
+# Public result object retained for interactive inspection.
+DMD_recovery = {
+    "metadata": {
+        "algorithm": DMD_algorithm,
+        "hankel_d": hankel_d if hankel_embedding_flag else None,
+        "rank_method": svd_rank_method,
+        "recovery_degrees": recovery_degrees.copy(),
+        "period_plot_window_years": (
+            period_plot_lower_bound,
+            period_plot_upper_bound,
+        ),
+        "period_window_is_plot_only": True,
+    },
+    "by_degree": synthetic_degree_results,
 }
 
-fig_q, ax_q = plot_quality_factor_recovery(
-    DMD_recovery_plot,
-    lower_lim_yr=plot_lower_lim_yr,
-    upper_lim_yr=plot_upper_lim_yr,
-)
-
-fig_eigenvalue, ax_eigenvalue = plot_continuous_eigenvalue_recovery(
-    DMD_recovery_plot,
-    lower_lim_yr=plot_lower_lim_yr,
-    upper_lim_yr=plot_upper_lim_yr,
-)
-
-fig_similarity, ax_similarity = plot_similarity_vs_recovered_period(
-    DMD_recovery_plot,
-    lower_lim_yr=plot_lower_lim_yr,
-    upper_lim_yr=plot_upper_lim_yr,
-)
-
-fig_modal_power, ax_modal_power = (
-    plot_modal_period_power(
-        modal_power_results,
-        show_ideal=show_ideal_all_modes,
-        period_xlim=modal_period_xlim,
-    )
-)
-
-(
-    fig_ensemble_candidate_power,
-    ax_ensemble_candidate_power,
-) = plot_ensemble_candidate_period_power(
-    ensemble_candidate_modal_power_results
-)
-
-(
-    fig_similarity_heatmap,
-    ax_similarity_heatmap,
-    similarity_heatmap_row_order,
-) = plot_resolved_mode_similarity_heatmap(
-    modal_power_results
-)
-
-fig_cumulative_variance = None
-ax_cumulative_variance = None
-perturbed_cumulative_variance_median = None
-noise_only_cumulative_variance_median = None
-fig_singular_value_magnitude = None
-ax_singular_value_magnitude = None
-perturbed_singular_value_magnitude_median = None
-noise_only_singular_value_magnitude_median = None
-
-if singular_value_plot_flag:
-    ideal_cumulative_variance = (
-        singular_value_cumulative_variance[
-            "ideal"
-        ]
-    )
-    resolved_cumulative_variance = (
-        singular_value_cumulative_variance[
-            "resolved"
-        ]
-    )
-    perturbed_cumulative_variance = (
-        singular_value_cumulative_variance[
-            "perturbed"
-        ]
-    )
-    noise_only_cumulative_variance = (
-        singular_value_cumulative_variance[
-            "noise_only"
-        ]
+if run_output_directory is not None:
+    DMD_recovery["metadata"]["run_output_directory"] = (
+        run_output_directory
     )
 
-    if (
-        ideal_cumulative_variance is None
-        or resolved_cumulative_variance is None
-    ):
-        raise RuntimeError(
-            "The ideal and resolved cumulative-variance "
-            "curves must both be available before plotting."
-        )
-
-    singular_value_indices = np.arange(
-        1,
-        ideal_cumulative_variance.size + 1,
-    )
-    marker_interval = max(
-        1,
-        singular_value_indices.size // 12,
-    )
-
-    fig_cumulative_variance, ax_cumulative_variance = (
-        plt.subplots(
-            figsize=(8, 6)
-        )
-    )
-
-    ax_cumulative_variance.plot(
-        singular_value_indices,
-        ideal_cumulative_variance,
-        color="tab:blue",
-        marker="+",
-        markevery=marker_interval,
-        markersize=7,
-        linewidth=1.8,
-        label="Ideal (no resolution mapping)",
-        zorder=5,
-    )
-
-    ax_cumulative_variance.plot(
-        singular_value_indices,
-        resolved_cumulative_variance,
-        color="tab:orange",
-        marker="x",
-        markevery=marker_interval,
-        markersize=6,
-        linewidth=1.8,
-        label="Resolved (resolution mapping applied)",
-        zorder=5,
-    )
-
-    if perturbed_cumulative_variance:
-        perturbed_cumulative_variance = np.stack(
-            perturbed_cumulative_variance,
-            axis=0,
-        )
-
-        for perturbation_index, perturbation_curve in enumerate(
-            perturbed_cumulative_variance
-        ):
-            ax_cumulative_variance.plot(
-                singular_value_indices,
-                perturbation_curve,
-                color="tab:green",
-                marker=".",
-                markevery=marker_interval,
-                markersize=3,
-                linewidth=0.8,
-                alpha=0.2,
-                label=(
-                    "Perturbed ensemble members"
-                    if perturbation_index == 0
-                    else None
-                ),
-                zorder=1,
-            )
-
-        perturbed_cumulative_variance_median = np.median(
-            perturbed_cumulative_variance,
-            axis=0,
-        )
-
-        perturbation_label = (
-            f"Perturbed median ({noise_temporal_model}"
-        )
-        if noise_temporal_model == "ar1":
-            perturbation_label += (
-                f", tau={noise_tau_years:g} years"
-            )
-        perturbation_label += ")"
-
-        ax_cumulative_variance.plot(
-            singular_value_indices,
-            perturbed_cumulative_variance_median,
-            color="tab:green",
-            marker="s",
-            markevery=marker_interval,
-            markersize=5,
-            linewidth=2.2,
-            alpha=1.0,
-            label=perturbation_label,
-            zorder=6,
-        )
-
-    if noise_only_cumulative_variance:
-        noise_only_cumulative_variance = np.stack(
-            noise_only_cumulative_variance,
-            axis=0,
-        )
-
-        for noise_index, noise_curve in enumerate(
-            noise_only_cumulative_variance
-        ):
-            ax_cumulative_variance.plot(
-                singular_value_indices,
-                noise_curve,
-                color="tab:purple",
-                marker="v",
-                markevery=marker_interval,
-                markersize=3,
-                linewidth=0.8,
-                alpha=0.2,
-                label=(
-                    "Perturbation-only ensemble members"
-                    if noise_index == 0
-                    else None
-                ),
-                zorder=1,
-            )
-
-        noise_only_cumulative_variance_median = np.median(
-            noise_only_cumulative_variance,
-            axis=0,
-        )
-
-        noise_only_label = (
-            "Perturbation-only median "
-            f"({noise_temporal_model}"
-        )
-        if noise_temporal_model == "ar1":
-            noise_only_label += (
-                f", tau={noise_tau_years:g} years"
-            )
-        noise_only_label += ")"
-
-        ax_cumulative_variance.plot(
-            singular_value_indices,
-            noise_only_cumulative_variance_median,
-            color="tab:purple",
-            marker="D",
-            markevery=marker_interval,
-            markersize=5,
-            linewidth=2.2,
-            alpha=1.0,
-            label=noise_only_label,
-            zorder=6,
-        )
-
-    embedding_plot_label = (
-        f"Hankel embedding d={hankel_d}"
-        if hankel_embedding_flag
-        else "no embedding"
-    )
-    svd_input_plot_label = (
-        "leading snapshot matrix X"
-        if DMD_algorithm in ("exact", "fbdmd")
-        else "full snapshot matrix"
-    )
-
-    ax_cumulative_variance.set_xlabel(
-        "Number of singular values retained, k"
-    )
-    ax_cumulative_variance.set_ylabel(
-        "Cumulative variance explained (fraction)"
-    )
-    ax_cumulative_variance.set_xlim(
-        1,
-        singular_value_indices[-1],
-    )
-    ax_cumulative_variance.set_ylim(
-        0.0,
-        1.0,
-    )
-
-    ax_cumulative_variance.set_title(
-        "Pre-truncation cumulative explained variance\n"
-        f"{DMD_algorithm}; {embedding_plot_label}; "
-        f"{svd_input_plot_label}; Nmax={Nmax}"
-    )
-    ax_cumulative_variance.grid(
-        alpha=0.25
-    )
-    ax_cumulative_variance.legend(
-        loc="best"
-    )
-    fig_cumulative_variance.tight_layout()
-
-    ideal_singular_value_magnitude = (
-        singular_value_magnitudes[
-            "ideal"
-        ]
-    )
-    resolved_singular_value_magnitude = (
-        singular_value_magnitudes[
-            "resolved"
-        ]
-    )
-    perturbed_singular_value_magnitudes = (
-        singular_value_magnitudes[
-            "perturbed"
-        ]
-    )
-    noise_only_singular_value_magnitudes = (
-        singular_value_magnitudes[
-            "noise_only"
-        ]
-    )
-
-    if (
-        ideal_singular_value_magnitude is None
-        or resolved_singular_value_magnitude is None
-    ):
-        raise RuntimeError(
-            "The ideal and resolved singular-value magnitude "
-            "curves must both be available before plotting."
-        )
-
-    if (
-        ideal_singular_value_magnitude.size
-        != singular_value_indices.size
-        or resolved_singular_value_magnitude.size
-        != singular_value_indices.size
-    ):
-        raise ValueError(
-            "The ideal, resolved, and cumulative-variance "
-            "singular-value indices must have equal lengths."
-        )
-
-    fig_singular_value_magnitude, ax_singular_value_magnitude = (
-        plt.subplots(
-            figsize=(8, 6)
-        )
-    )
-
-    retained_indices = singular_value_indices[
-        :svd_rank
-    ]
-    truncated_indices = singular_value_indices[
-        svd_rank:
-    ]
-
-    def scatter_signal_spectrum(
-        values,
-        color,
-        label,
-        retained_alpha=1.0,
-        truncated_alpha=0.75,
-        retained_size=34,
-        truncated_size=18,
-        zorder=5,
-    ):
-        """Plot retained signal values as crosses and truncated values as dots."""
-
-        ax_singular_value_magnitude.scatter(
-            retained_indices,
-            values[:svd_rank],
-            color=color,
-            marker="x",
-            s=retained_size,
-            linewidths=1.2,
-            alpha=retained_alpha,
-            label=f"{label}: retained",
-            zorder=zorder,
-        )
-
-        if truncated_indices.size:
-            ax_singular_value_magnitude.scatter(
-                truncated_indices,
-                values[svd_rank:],
-                color=color,
-                marker=".",
-                s=truncated_size,
-                alpha=truncated_alpha,
-                label=f"{label}: truncated",
-                zorder=zorder,
-            )
-
-    scatter_signal_spectrum(
-        ideal_singular_value_magnitude,
-        color="tab:blue",
-        label="Ideal",
-        zorder=7,
-    )
-
-    scatter_signal_spectrum(
-        resolved_singular_value_magnitude,
-        color="tab:orange",
-        label="Resolved",
-        zorder=8,
-    )
-
-    if perturbed_singular_value_magnitudes:
-        perturbed_singular_value_magnitudes = np.stack(
-            perturbed_singular_value_magnitudes,
-            axis=0,
-        )
-
-        for perturbation_index, perturbation_curve in enumerate(
-            perturbed_singular_value_magnitudes
-        ):
-            ax_singular_value_magnitude.scatter(
-                retained_indices,
-                perturbation_curve[:svd_rank],
-                color="tab:green",
-                marker="x",
-                s=15,
-                linewidths=0.7,
-                alpha=0.15,
-                zorder=1,
-            )
-            if truncated_indices.size:
-                ax_singular_value_magnitude.scatter(
-                    truncated_indices,
-                    perturbation_curve[svd_rank:],
-                    color="tab:green",
-                    marker=".",
-                    s=8,
-                    alpha=0.15,
-                    zorder=1,
-                )
-
-        perturbed_singular_value_magnitude_median = np.median(
-            perturbed_singular_value_magnitudes,
-            axis=0,
-        )
-
-        scatter_signal_spectrum(
-            perturbed_singular_value_magnitude_median,
-            color="tab:green",
-            label=perturbation_label,
-            retained_size=38,
-            truncated_size=22,
-            zorder=6,
-        )
-
-    if noise_only_singular_value_magnitudes:
-        noise_only_singular_value_magnitudes = np.stack(
-            noise_only_singular_value_magnitudes,
-            axis=0,
-        )
-
-        for noise_index, noise_curve in enumerate(
-            noise_only_singular_value_magnitudes
-        ):
-            ax_singular_value_magnitude.scatter(
-                singular_value_indices,
-                noise_curve,
-                color="tab:purple",
-                marker=".",
-                s=7,
-                alpha=0.06,
-                label=(
-                    "Noise-only realisations"
-                    if noise_index == 0
-                    else None
-                ),
-                zorder=1,
-            )
-
-        noise_only_singular_value_magnitude_median = np.median(
-            noise_only_singular_value_magnitudes,
-            axis=0,
-        )
-
-        ax_singular_value_magnitude.scatter(
-            singular_value_indices,
-            noise_only_singular_value_magnitude_median,
-            color="tab:purple",
-            marker=".",
-            s=20,
-            alpha=1.0,
-            label=noise_only_label,
-            zorder=6,
-        )
-
-    threshold_percent = (
-        100.0
-        * noise_rank_quantile
-    )
-    ax_singular_value_magnitude.axhline(
-        noise_singular_value_threshold,
-        color="black",
-        linestyle="--",
-        linewidth=1.4,
-        label=(
-            f"q{threshold_percent:g} of noise-only "
-            r"$\sigma_1$"
-        ),
-        zorder=4,
-    )
-    ax_singular_value_magnitude.annotate(
-        (
-            f"Selected rank = {svd_rank}; "
-            f"retain singular values 1–{svd_rank}"
-        ),
-        xy=(
-            min(
-                svd_rank + 0.5,
-                singular_value_indices[-1],
-            ),
-            noise_singular_value_threshold,
-        ),
-        xytext=(8, 8),
-        textcoords="offset points",
-        ha="left",
-        va="bottom",
-        fontsize=9,
-        color="black",
-        bbox={
-            "facecolor": "white",
-            "edgecolor": "none",
-            "alpha": 0.75,
-            "pad": 1.5,
-        },
-        zorder=10,
-    )
-
-    ax_singular_value_magnitude.set_xlabel(
-        "Singular value index, k"
-    )
-    ax_singular_value_magnitude.set_ylabel(
-        "Singular value magnitude"
-    )
-    ax_singular_value_magnitude.set_xlim(
-        1,
-        singular_value_indices[-1],
-    )
-    ax_singular_value_magnitude.set_yscale(
-        "log"
-    )
-
-    finite_positive_noise_magnitudes = (
-        noise_only_singular_value_magnitudes[
-            np.isfinite(
-                noise_only_singular_value_magnitudes
-            )
-            & (
-                noise_only_singular_value_magnitudes
-                > 0.0
-            )
-        ]
-    )
-
-    if finite_positive_noise_magnitudes.size == 0:
-        raise ValueError(
-            "The singular-value magnitude plot requires at "
-            "least one finite positive noise-only magnitude "
-            "for its logarithmic lower y-limit."
-        )
-
-    magnitude_suites = [
-        ideal_singular_value_magnitude,
-        resolved_singular_value_magnitude,
-        noise_only_singular_value_magnitudes,
-    ]
-
-    if isinstance(
-        perturbed_singular_value_magnitudes,
-        np.ndarray,
-    ):
-        magnitude_suites.append(
-            perturbed_singular_value_magnitudes
-        )
-
-    finite_magnitude_maxima = [
-        np.max(
-            magnitudes[
-                np.isfinite(magnitudes)
-            ]
-        )
-        for magnitudes in magnitude_suites
-        if np.any(
-            np.isfinite(magnitudes)
-        )
-    ]
-
-    singular_value_plot_lower_limit = float(
-        np.min(
-            finite_positive_noise_magnitudes
-        )
-    )
-    singular_value_plot_upper_limit = float(
-        np.max(
-            finite_magnitude_maxima
-        )
-    )
-
-    if (
-        singular_value_plot_upper_limit
-        <= singular_value_plot_lower_limit
-    ):
-        raise ValueError(
-            "The singular-value magnitude plot requires its "
-            "largest data magnitude to exceed its smallest "
-            "positive noise-only magnitude."
-        )
-
-    ax_singular_value_magnitude.set_ylim(
-        singular_value_plot_lower_limit,
-        singular_value_plot_upper_limit,
-    )
-    ax_singular_value_magnitude.set_title(
-        "Pre-truncation singular-value magnitude\n"
-        f"{DMD_algorithm}; {embedding_plot_label}; "
-        f"{svd_input_plot_label}; Nmax={Nmax}; "
-        f"selected rank={svd_rank}"
-    )
-    ax_singular_value_magnitude.grid(
-        alpha=0.25,
-        which="both",
-    )
-    ax_singular_value_magnitude.legend(
-        loc="best"
-    )
-    fig_singular_value_magnitude.tight_layout()
-
-fig_degree_sweep_periods = None
-ax_degree_sweep_periods = None
-fig_degree_sweep_static = None
-ax_degree_sweep_static = None
-fig_degree_sweep_svd_rank = None
-ax_degree_sweep_svd_rank = None
-
-if degree_sweep_flag:
-    active_true_periods = np.asarray([
-        synthetic_suite_info[
-            mode_number
-        ][
-            "true_period"
-        ]
-        for mode_number in matching_mode_numbers
-    ], dtype=float)
-
-    (
-        fig_degree_sweep_periods,
-        ax_degree_sweep_periods,
-    ) = plot_degree_sweep_recovered_periods(
-        degree_sweep_results,
-        true_periods=active_true_periods,
-    )
-
-    (
-        fig_degree_sweep_static,
-        ax_degree_sweep_static,
-    ) = plot_degree_sweep_static_counts(
-        degree_sweep_results
-    )
-
-    (
-        fig_degree_sweep_svd_rank,
-        ax_degree_sweep_svd_rank,
-    ) = plot_degree_sweep_svd_rank(
-        degree_sweep_results
-    )
-
-plt.show()
-# %%
-if video_plot:
-    print("\nVIDEO RECOVERY AMPLITUDES")
-
-    for i, mode_number in enumerate(mode_numbers):
-
-        idx = DMD_recovery[
-            mode_number
-        ]["DMD"].get(
-            "candidate_index"
-        )
-
-        exact_max = np.max(
-            np.abs(
-                video_data["exact"][i]
-            )
-        )
-
-        resolved_max = np.max(
-            np.abs(
-                video_data["resolved"][i]
-            )
-        )
-
-        recovered_max = np.max(
-            np.abs(
-                video_data["recovered"][i]
-            )
-        )
-
-        print(
-            f"Mode {mode_number}: "
-            f"candidate={idx}, "
-            f"exact={exact_max:.4e}, "
-            f"resolved={resolved_max:.4e}, "
-            f"recovered={recovered_max:.4e}, "
-            f"rec/res={recovered_max / resolved_max if resolved_max else np.nan:.4e}"
-        )
-# %%
-import inspect
-
-print(inspect.getsource(best_spatial_match))
-# %%
+if show_figures_interactively:
+    plt.show()

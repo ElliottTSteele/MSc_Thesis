@@ -119,11 +119,14 @@ def prepare_recovery_video_data(
     truncate_gauss_coeffs,
     recovered_sum_candidate_eigs=None,
     recovered_sum_candidate_modes=None,
+    clean_candidate_ids=None,
+    recovered_sum_candidate_ids=None,
     high_q_flag=False,
     good_record_slice=None,
     truth_t0_year=None,
     truth_include_growth=False,
     frame_spacing_years=1.0,
+    compact_input_threshold=8,
 ):
     """Precompute exact, resolved and recovered fields for the clean DMD video.
 
@@ -142,6 +145,18 @@ def prepare_recovery_video_data(
        for the overall recovered total. This allows static candidates to remain
        in that total while the per-mode matching suite obeys a finite-period
        filter. If omitted, the clean matching suite is used for both purposes.
+    5. ``clean_candidate_ids`` and ``recovered_sum_candidate_ids`` identify
+       candidates before any period filtering. They are required to reconcile
+       the two suites in compact videos when the suites differ.
+
+    Compact layout
+    --------------
+    If the number of active input modes exceeds ``compact_input_threshold``,
+    this function stores lightweight row recipes rather than dense
+    mode-by-frame-by-space fields. Inputs selecting the same recovered
+    candidate are grouped into one row, followed by retained candidates that
+    no input selected. The renderer evaluates these recipes one frame at a
+    time.
 
     Truth convention
     ----------------
@@ -164,6 +179,24 @@ def prepare_recovery_video_data(
             "clean_candidate_modes columns must equal clean_candidate_eigs size."
         )
 
+    if clean_candidate_ids is None:
+        clean_candidate_ids = np.arange(
+            clean_candidate_eigs.size,
+            dtype=int,
+        )
+    else:
+        clean_candidate_ids = np.asarray(
+            clean_candidate_ids,
+            dtype=int,
+        ).ravel()
+
+    if clean_candidate_ids.size != clean_candidate_eigs.size:
+        raise ValueError(
+            "clean_candidate_ids must contain one ID per clean candidate."
+        )
+    if np.unique(clean_candidate_ids).size != clean_candidate_ids.size:
+        raise ValueError("clean_candidate_ids must be unique.")
+
     if (
         recovered_sum_candidate_eigs is None
         and recovered_sum_candidate_modes is None
@@ -173,6 +206,9 @@ def prepare_recovery_video_data(
         )
         recovered_sum_candidate_modes = (
             clean_candidate_modes
+        )
+        recovered_sum_candidate_ids = (
+            clean_candidate_ids
         )
     elif (
         recovered_sum_candidate_eigs is None
@@ -193,6 +229,19 @@ def prepare_recovery_video_data(
         dtype=complex,
     )
 
+    if recovered_sum_candidate_ids is None:
+        if recovered_sum_candidate_eigs.size != clean_candidate_eigs.size:
+            raise ValueError(
+                "recovered_sum_candidate_ids are required when the clean "
+                "matching and recovered-sum candidate suites differ."
+            )
+        recovered_sum_candidate_ids = clean_candidate_ids.copy()
+    else:
+        recovered_sum_candidate_ids = np.asarray(
+            recovered_sum_candidate_ids,
+            dtype=int,
+        ).ravel()
+
     if recovered_sum_candidate_modes.ndim != 2:
         raise ValueError(
             "recovered_sum_candidate_modes must be 2-D "
@@ -206,6 +255,19 @@ def prepare_recovery_video_data(
             "recovered_sum_candidate_modes columns must equal "
             "recovered_sum_candidate_eigs size."
         )
+    if (
+        recovered_sum_candidate_ids.size
+        != recovered_sum_candidate_eigs.size
+    ):
+        raise ValueError(
+            "recovered_sum_candidate_ids must contain one ID per "
+            "recovered-sum candidate."
+        )
+    if (
+        np.unique(recovered_sum_candidate_ids).size
+        != recovered_sum_candidate_ids.size
+    ):
+        raise ValueError("recovered_sum_candidate_ids must be unique.")
     if (
         recovered_sum_candidate_modes.shape[0]
         != clean_candidate_modes.shape[0]
@@ -238,6 +300,52 @@ def prepare_recovery_video_data(
     n_modes = len(mode_numbers)
     n_frames = frame_years.size
     n_physical = clean_candidate_modes.shape[0]
+
+    if (
+        isinstance(
+            compact_input_threshold,
+            (bool, np.bool_),
+        )
+        or not isinstance(
+            compact_input_threshold,
+            (int, np.integer),
+        )
+        or compact_input_threshold < 1
+    ):
+        raise ValueError(
+            "compact_input_threshold must be a positive integer."
+        )
+
+    if n_modes > int(compact_input_threshold):
+        return _prepare_compact_recovery_video_data(
+            mode_numbers=mode_numbers,
+            DMD_recovery=DMD_recovery,
+            synthetic_suite_info=synthetic_suite_info,
+            target_phasors=target_phasors,
+            clean_candidate_eigs=clean_candidate_eigs,
+            clean_candidate_ids=clean_candidate_ids,
+            recovered_sum_candidate_eigs=
+                recovered_sum_candidate_eigs,
+            recovered_sum_candidate_modes=
+                recovered_sum_candidate_modes,
+            recovered_sum_candidate_ids=
+                recovered_sum_candidate_ids,
+            A_r_current=A_r_current,
+            frame_indices=frame_indices,
+            frame_years=frame_years,
+            frame_mjd2000=None,
+            model_time_years=model_time_years,
+            fit_t0_year=fit_t0_year,
+            truth_t0_year=float(truth_t0_year),
+            dmd_times=dmd_times,
+            truth_times=truth_times,
+            Nmax=Nmax,
+            truncate_gauss_coeffs=truncate_gauss_coeffs,
+            truth_include_growth=truth_include_growth,
+            compact_input_threshold=int(
+                compact_input_threshold
+            ),
+        )
 
     exact = np.empty((n_modes, n_frames, n_physical), dtype=np.float64)
     resolved = np.empty_like(exact)
@@ -348,6 +456,7 @@ def prepare_recovery_video_data(
         frame_mjd2000 = np.full(frame_years.shape, np.nan)
 
     return {
+        "layout": "full",
         "mode_numbers": mode_numbers,
         "frame_indices": frame_indices,
         "frame_years": frame_years,
@@ -364,6 +473,485 @@ def prepare_recovery_video_data(
     }
 
 
+def _candidate_period_from_eigenvalue(eigenvalue):
+    """Return an oscillatory period in years, or infinity for a static mode."""
+
+    omega = abs(complex(eigenvalue).imag)
+    if omega == 0.0:
+        return np.inf
+    return float(2.0 * np.pi / omega)
+
+
+def _prepare_compact_recovery_video_data(
+    *,
+    mode_numbers,
+    DMD_recovery,
+    synthetic_suite_info,
+    target_phasors,
+    clean_candidate_eigs,
+    clean_candidate_ids,
+    recovered_sum_candidate_eigs,
+    recovered_sum_candidate_modes,
+    recovered_sum_candidate_ids,
+    A_r_current,
+    frame_indices,
+    frame_years,
+    frame_mjd2000,
+    model_time_years,
+    fit_t0_year,
+    truth_t0_year,
+    dmd_times,
+    truth_times,
+    Nmax,
+    truncate_gauss_coeffs,
+    truth_include_growth,
+    compact_input_threshold,
+):
+    """Build compact row recipes without dense physical-space frame arrays."""
+
+    candidate_groups = {}
+    unmatched_input_modes = []
+    overall_truth_components = []
+    overall_resolved_coefficients = None
+
+    for mode_number in mode_numbers:
+        if mode_number not in synthetic_suite_info:
+            raise KeyError(
+                f"Missing synthetic_suite_info for mode {mode_number}."
+            )
+        if mode_number not in target_phasors:
+            raise KeyError(
+                f"Missing target_phasors entry for mode {mode_number}."
+            )
+
+        info = synthetic_suite_info[mode_number]
+        true_eig = complex(info["true_eigenvalue"])
+        truth_eig = (
+            true_eig
+            if truth_include_growth
+            else 1j * true_eig.imag
+        )
+        target_phasor = np.asarray(
+            target_phasors[mode_number],
+            dtype=complex,
+        ).reshape(-1)
+
+        if target_phasor.size != recovered_sum_candidate_modes.shape[0]:
+            raise ValueError(
+                f"Mode {mode_number}: target phasor size "
+                f"{target_phasor.size} does not match the recovered "
+                f"physical-space size "
+                f"{recovered_sum_candidate_modes.shape[0]}."
+            )
+
+        truth_component = {
+            "mode_number": mode_number,
+            "phasor": target_phasor,
+            "eigenvalue": truth_eig,
+        }
+        overall_truth_components.append(
+            truth_component
+        )
+
+        if "gnm_resolved" not in info:
+            raise KeyError(
+                f"Mode {mode_number} is missing synthetic_suite_info[mode]"
+                "['gnm_resolved']. Store the individually resolved time "
+                "series when building the synthetic suite."
+            )
+
+        gnm_resolved = np.asarray(
+            info["gnm_resolved"]
+        )
+        gnm_resolved_nmax = np.asarray(
+            truncate_gauss_coeffs(
+                gnm_resolved,
+                tmax=Nmax,
+            )
+        )
+
+        if gnm_resolved_nmax.shape[0] != model_time_years.size:
+            raise ValueError(
+                f"Mode {mode_number}: resolved time-series length "
+                f"{gnm_resolved_nmax.shape[0]} does not match "
+                f"model_time_years length {model_time_years.size}."
+            )
+
+        resolved_coefficients = (
+            gnm_resolved_nmax[
+                frame_indices
+            ].copy()
+        )
+
+        if overall_resolved_coefficients is None:
+            overall_resolved_coefficients = np.zeros_like(
+                resolved_coefficients
+            )
+        elif (
+            resolved_coefficients.shape
+            != overall_resolved_coefficients.shape
+        ):
+            raise ValueError(
+                "Individually resolved input modes do not share one "
+                "Gauss-coefficient shape."
+            )
+
+        overall_resolved_coefficients += (
+            resolved_coefficients
+        )
+
+        clean_match = DMD_recovery[
+            mode_number
+        ].get("DMD", {})
+        candidate_index = clean_match.get(
+            "candidate_index"
+        )
+
+        if candidate_index is None:
+            unmatched_input_modes.append(
+                mode_number
+            )
+            continue
+
+        candidate_index = int(
+            candidate_index
+        )
+        if not (
+            0
+            <= candidate_index
+            < clean_candidate_ids.size
+        ):
+            raise IndexError(
+                f"Mode {mode_number}: candidate_index="
+                f"{candidate_index} is outside the clean candidate "
+                f"suite of size {clean_candidate_ids.size}."
+            )
+
+        candidate_id = int(
+            clean_candidate_ids[
+                candidate_index
+            ]
+        )
+
+        if candidate_id not in candidate_groups:
+            candidate_groups[
+                candidate_id
+            ] = {
+                "candidate_id": candidate_id,
+                "clean_candidate_index":
+                    candidate_index,
+                "input_modes": [],
+                "similarities": [],
+                "truth_components": [],
+                "resolved_coefficients":
+                    np.zeros_like(
+                        resolved_coefficients
+                    ),
+            }
+
+        group = candidate_groups[
+            candidate_id
+        ]
+        group["input_modes"].append(
+            mode_number
+        )
+        group["similarities"].append(
+            float(
+                clean_match.get(
+                    "similarity",
+                    np.nan,
+                )
+            )
+        )
+        group["truth_components"].append(
+            truth_component
+        )
+        group["resolved_coefficients"] += (
+            resolved_coefficients
+        )
+
+    recovered_sum_index_by_id = {
+        int(candidate_id): candidate_index
+        for candidate_index, candidate_id in enumerate(
+            recovered_sum_candidate_ids
+        )
+    }
+
+    compact_rows = []
+
+    for candidate_id, group in candidate_groups.items():
+        if candidate_id not in recovered_sum_index_by_id:
+            raise ValueError(
+                "A clean matched candidate is missing from the "
+                "recovered-sum video suite: "
+                f"candidate ID {candidate_id}."
+            )
+
+        recovered_index = recovered_sum_index_by_id[
+            candidate_id
+        ]
+        eigenvalue = recovered_sum_candidate_eigs[
+            recovered_index
+        ]
+
+        compact_rows.append({
+            "kind": "matched",
+            **group,
+            "recovered_sum_candidate_index":
+                int(recovered_index),
+            "eigenvalue": eigenvalue,
+            "period": (
+                float(
+                    DMD_recovery[
+                        group["input_modes"][0]
+                    ]["DMD"].get(
+                        "recovered_period",
+                        _candidate_period_from_eigenvalue(
+                            eigenvalue
+                        ),
+                    )
+                )
+            ),
+            "phasor": recovered_sum_candidate_modes[
+                :,
+                recovered_index,
+            ],
+        })
+
+    matched_candidate_ids = set(
+        candidate_groups
+    )
+    unmatched_dmd_candidate_ids = []
+
+    for recovered_index, candidate_id in enumerate(
+        recovered_sum_candidate_ids
+    ):
+        candidate_id = int(candidate_id)
+        if candidate_id in matched_candidate_ids:
+            continue
+
+        unmatched_dmd_candidate_ids.append(
+            candidate_id
+        )
+        eigenvalue = recovered_sum_candidate_eigs[
+            recovered_index
+        ]
+        compact_rows.append({
+            "kind": "unmatched_dmd",
+            "candidate_id": candidate_id,
+            "recovered_sum_candidate_index":
+                int(recovered_index),
+            "input_modes": [],
+            "similarities": [],
+            "truth_components": [],
+            "resolved_coefficients": None,
+            "eigenvalue": eigenvalue,
+            "period":
+                _candidate_period_from_eigenvalue(
+                    eigenvalue
+                ),
+            "phasor": recovered_sum_candidate_modes[
+                :,
+                recovered_index,
+            ],
+        })
+
+    if frame_mjd2000 is None:
+        if cp is not None:
+            frame_mjd2000 = np.asarray(
+                cp.data_utils.dyear_to_mjd(
+                    frame_years
+                ),
+                dtype=float,
+            )
+        else:
+            frame_mjd2000 = np.full(
+                frame_years.shape,
+                np.nan,
+            )
+
+    matched_input_count = (
+        len(mode_numbers)
+        - len(unmatched_input_modes)
+    )
+    unique_matched_candidate_count = len(
+        candidate_groups
+    )
+    shared_input_count = max(
+        0,
+        matched_input_count
+        - unique_matched_candidate_count,
+    )
+
+    return {
+        "layout": "compact",
+        "compact_input_threshold":
+            compact_input_threshold,
+        "mode_numbers": mode_numbers,
+        "frame_indices": frame_indices,
+        "frame_years": frame_years,
+        "frame_mjd2000": frame_mjd2000,
+        "fit_t0_year": fit_t0_year,
+        "truth_t0_year": truth_t0_year,
+        "truth_times": truth_times,
+        "dmd_times": dmd_times,
+        "A_r_current": np.asarray(
+            A_r_current
+        ),
+        "compact_rows": compact_rows,
+        "overall_truth_components":
+            overall_truth_components,
+        "overall_resolved_coefficients":
+            overall_resolved_coefficients,
+        "recovered_sum_candidate_eigs":
+            recovered_sum_candidate_eigs,
+        "recovered_sum_candidate_modes":
+            recovered_sum_candidate_modes,
+        "recovered_sum_candidate_ids":
+            recovered_sum_candidate_ids,
+        "summary": {
+            "input_count": len(mode_numbers),
+            "matched_input_count":
+                matched_input_count,
+            "unmatched_input_count":
+                len(unmatched_input_modes),
+            "unmatched_input_modes":
+                unmatched_input_modes,
+            "unique_matched_dmd_count":
+                unique_matched_candidate_count,
+            "shared_input_count":
+                shared_input_count,
+            "unmatched_dmd_count":
+                len(
+                    unmatched_dmd_candidate_ids
+                ),
+            "unmatched_dmd_candidate_ids":
+                unmatched_dmd_candidate_ids,
+        },
+    }
+
+
+def _evaluate_truth_components(
+    truth_components,
+    truth_time,
+    n_physical,
+):
+    """Evaluate and sum exact input components at one video time."""
+
+    field = np.zeros(
+        n_physical,
+        dtype=float,
+    )
+    for component in truth_components:
+        field += np.real(
+            component["phasor"]
+            * np.exp(
+                component["eigenvalue"]
+                * truth_time
+            )
+        )
+    return field
+
+
+def _compact_recovery_frame_fields(
+    video_data,
+    frame_i,
+):
+    """Evaluate all compact rows at one frame without retaining a frame cube."""
+
+    n_physical = video_data[
+        "recovered_sum_candidate_modes"
+    ].shape[0]
+    truth_time = video_data[
+        "truth_times"
+    ][frame_i]
+    dmd_time = video_data[
+        "dmd_times"
+    ][frame_i]
+    projection = video_data[
+        "A_r_current"
+    ]
+    zero_field = np.zeros(
+        n_physical,
+        dtype=float,
+    )
+    rows = []
+
+    for row in video_data[
+        "compact_rows"
+    ]:
+        recovered = np.real(
+            row["phasor"]
+            * np.exp(
+                row["eigenvalue"]
+                * dmd_time
+            )
+        )
+
+        if row["kind"] == "matched":
+            exact = _evaluate_truth_components(
+                row["truth_components"],
+                truth_time,
+                n_physical,
+            )
+            resolved = (
+                projection
+                @ row[
+                    "resolved_coefficients"
+                ][frame_i]
+            )
+            difference = recovered - exact
+        else:
+            exact = zero_field
+            resolved = zero_field
+            difference = zero_field
+
+        rows.append(
+            (
+                exact,
+                resolved,
+                recovered,
+                difference,
+            )
+        )
+
+    exact_sum = _evaluate_truth_components(
+        video_data[
+            "overall_truth_components"
+        ],
+        truth_time,
+        n_physical,
+    )
+    resolved_sum = (
+        projection
+        @ video_data[
+            "overall_resolved_coefficients"
+        ][frame_i]
+    )
+    temporal = np.exp(
+        video_data[
+            "recovered_sum_candidate_eigs"
+        ]
+        * dmd_time
+    )
+    recovered_sum = np.real(
+        video_data[
+            "recovered_sum_candidate_modes"
+        ]
+        @ temporal
+    )
+    rows.append(
+        (
+            exact_sum,
+            resolved_sum,
+            recovered_sum,
+            recovered_sum - exact_sum,
+        )
+    )
+
+    return rows
+
+
 def compute_video_row_limits(video_data, minimum_vmax=1e-12):
     """Compute one fixed symmetric colour scale per row over ALL video frames.
 
@@ -373,6 +961,58 @@ def compute_video_row_limits(video_data, minimum_vmax=1e-12):
     No percentile clipping or frame-by-frame normalization is used, preserving
     true relative amplitudes through time and across the four panels in a row.
     """
+    if video_data.get("layout", "full") == "compact":
+        n_rows = (
+            len(
+                video_data[
+                    "compact_rows"
+                ]
+            )
+            + 1
+        )
+        row_vmax = np.full(
+            n_rows,
+            float(minimum_vmax),
+            dtype=float,
+        )
+
+        for frame_i in tqdm(
+            range(
+                len(
+                    video_data[
+                        "frame_years"
+                    ]
+                )
+            ),
+            desc="Scanning recovery video limits",
+        ):
+            rows = _compact_recovery_frame_fields(
+                video_data,
+                frame_i,
+            )
+            for row_i, fields in enumerate(
+                rows
+            ):
+                for field in fields:
+                    finite = np.isfinite(
+                        field
+                    )
+                    if np.any(finite):
+                        row_vmax[row_i] = max(
+                            row_vmax[row_i],
+                            float(
+                                np.max(
+                                    np.abs(
+                                        field[
+                                            finite
+                                        ]
+                                    )
+                                )
+                            ),
+                        )
+
+        return row_vmax
+
     exact = np.asarray(video_data["exact"])
     resolved = np.asarray(video_data["resolved"])
     recovered = np.asarray(video_data["recovered"])
@@ -434,8 +1074,14 @@ def make_dmd_recovery_video(
 
     Layout
     ------
-    One row per theoretical wave mode:
+    Full layout (up to the configured compact-input threshold):
+        one row per theoretical wave mode:
         exact input | resolved input | matched DMD output | DMD - exact
+
+    Compact layout:
+        one row per unique matched DMD candidate, using the summed exact and
+        resolved fields of every input that selected that candidate, followed
+        by every retained DMD candidate that no input selected.
 
     Final row:
         exact sum | resolved sum | all retained recovered modes |
@@ -448,13 +1094,36 @@ def make_dmd_recovery_video(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    compact_layout = (
+        video_data.get(
+            "layout",
+            "full",
+        )
+        == "compact"
+    )
     mode_numbers = video_data["mode_numbers"]
-    n_mode_rows = len(mode_numbers)
+    if compact_layout:
+        n_mode_rows = len(
+            video_data[
+                "compact_rows"
+            ]
+        )
+    else:
+        n_mode_rows = len(mode_numbers)
     n_rows = n_mode_rows + 1
     n_frames = len(video_data["frame_years"])
 
     if figsize is None:
-        figsize = (18.0, 2.05 * n_rows + 1.6)
+        if compact_layout:
+            figsize = (
+                18.0,
+                1.75 * n_rows + 2.0,
+            )
+        else:
+            figsize = (
+                18.0,
+                2.05 * n_rows + 1.6,
+            )
 
     row_vmax = compute_video_row_limits(video_data)
 
@@ -466,6 +1135,11 @@ def make_dmd_recovery_video(
         hspace=0.34,
         wspace=0.08,
     )
+    if compact_layout:
+        fig.subplots_adjust(
+            bottom=0.045,
+            top=0.955,
+        )
 
     axes = np.empty((n_rows, 4), dtype=object)
     images = np.empty((n_rows, 4), dtype=object)
@@ -474,6 +1148,12 @@ def make_dmd_recovery_video(
     extent = (-180.0, 180.0, -90.0, 90.0)
 
     def frame_fields(frame_i):
+        if compact_layout:
+            return _compact_recovery_frame_fields(
+                video_data,
+                frame_i,
+            )
+
         rows = []
         for mode_i in range(n_mode_rows):
             exact = video_data["exact"][mode_i, frame_i]
@@ -493,19 +1173,104 @@ def make_dmd_recovery_video(
 
     first_rows = frame_fields(0)
 
+    def format_input_modes(input_modes):
+        chunks = []
+        for start in range(
+            0,
+            len(input_modes),
+            4,
+        ):
+            chunks.append(
+                ", ".join(
+                    str(mode)
+                    for mode in input_modes[
+                        start:start + 4
+                    ]
+                )
+            )
+        return "\n".join(chunks)
+
     for row_i in range(n_rows):
         vmax = row_vmax[row_i]
         norm = Normalize(vmin=-vmax, vmax=vmax)
+        unavailable_columns = ()
 
         if row_i < n_mode_rows:
-            mode_number = mode_numbers[row_i]
-            titles = (
-                "Exact input",
-                "Resolved input",
-                "Matched DMD",
-                "DMD - exact",
-            )
-            row_label = f"Mode {mode_number}"
+            if compact_layout:
+                compact_row = video_data[
+                    "compact_rows"
+                ][row_i]
+                candidate_id = compact_row[
+                    "candidate_id"
+                ]
+                period = compact_row[
+                    "period"
+                ]
+                period_text = (
+                    "static"
+                    if np.isinf(period)
+                    else f"{period:.2f} yr"
+                )
+
+                if (
+                    compact_row["kind"]
+                    == "matched"
+                ):
+                    input_modes = compact_row[
+                        "input_modes"
+                    ]
+                    input_label = (
+                        format_input_modes(
+                            input_modes
+                        )
+                    )
+                    plural = (
+                        "s"
+                        if len(input_modes) != 1
+                        else ""
+                    )
+                    titles = (
+                        f"Exact counterpart{plural}",
+                        f"Resolved counterpart{plural}",
+                        "Matched DMD",
+                        "DMD - exact counterpart(s)",
+                    )
+                    row_label = (
+                        f"DMD candidate {candidate_id}\n"
+                        f"period={period_text}\n"
+                        f"Best for input{plural}:\n"
+                        f"{input_label}"
+                    )
+                else:
+                    titles = (
+                        "No matched input",
+                        "No matched input",
+                        "Unmatched recovered DMD",
+                        "No matched-input difference",
+                    )
+                    row_label = (
+                        f"DMD candidate {candidate_id}\n"
+                        f"period={period_text}\n"
+                        "No input selected this candidate"
+                    )
+                    unavailable_columns = (
+                        0,
+                        1,
+                        3,
+                    )
+            else:
+                mode_number = mode_numbers[
+                    row_i
+                ]
+                titles = (
+                    "Exact input",
+                    "Resolved input",
+                    "Matched DMD",
+                    "DMD - exact",
+                )
+                row_label = (
+                    f"Mode {mode_number}"
+                )
         else:
             titles = (
                 "Exact sum",
@@ -538,6 +1303,17 @@ def make_dmd_recovery_video(
             images[row_i, col_i] = image
 
             ax.set_title(titles[col_i], fontsize=8)
+            if col_i in unavailable_columns:
+                ax.text(
+                    0.5,
+                    0.5,
+                    "N/A",
+                    transform=ax.transAxes,
+                    ha="center",
+                    va="center",
+                    fontsize=9,
+                    color="0.35",
+                )
             ax.set_xlim(-180, 180)
             ax.set_ylim(-90, 90)
             ax.set_xticks([-180, -90, 0, 90, 180])
@@ -562,6 +1338,51 @@ def make_dmd_recovery_video(
         cbar.set_label("nT/yr", fontsize=7)
         cbar.ax.tick_params(labelsize=6)
         cbars.append(cbar)
+
+    if compact_layout:
+        summary = video_data[
+            "summary"
+        ]
+        unmatched_input_text = (
+            str(
+                summary[
+                    "unmatched_input_count"
+                ]
+            )
+        )
+        if summary[
+            "unmatched_input_modes"
+        ]:
+            unmatched_input_text += (
+                " ["
+                + ", ".join(
+                    str(mode)
+                    for mode in summary[
+                        "unmatched_input_modes"
+                    ]
+                )
+                + "]"
+            )
+
+        footer_text = (
+            f"Input modes: {summary['input_count']} | "
+            "inputs with no finite DMD match: "
+            f"{unmatched_input_text} | "
+            "unique matched DMD candidates: "
+            f"{summary['unique_matched_dmd_count']} | "
+            "additional inputs sharing a candidate: "
+            f"{summary['shared_input_count']} | "
+            "unmatched retained DMD candidates: "
+            f"{summary['unmatched_dmd_count']}"
+        )
+        fig.text(
+            0.5,
+            0.012,
+            footer_text,
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
 
     algorithm_label = str(DMD_algorithm).upper()
     parameter_bits = [

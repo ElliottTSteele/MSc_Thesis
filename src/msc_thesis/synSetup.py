@@ -74,14 +74,11 @@ lmax_felix_provided = 60
 r_cmb = 3485 # km radius at CMB
 r_earth = 6371.2 # km radius at earth surface
 
-state_shape = (181, 360) # snapshot shape used globally
-n_points_globally = state_shape[0]*state_shape[1] # number of points in grid
-
-# all data uses 1^o evenly spaced grid, incl poles
-# latitude, colatitude, longitude (degrees):
-colatitude = np.arange(0, 181, 1)
-latitude = colatitude - 90
-longitude = np.arange(0, 360, 1)
+# latitude/ longitude parameters
+d_degree = 5 # cell width in degrees
+colatitude = np.arange(5, 176, d_degree)
+latitude = 90 - colatitude 
+longitude = np.arange(0, 360, d_degree)
 # theta, phi (radians):
 theta = np.deg2rad(colatitude)
 phi = np.deg2rad(longitude)
@@ -92,68 +89,62 @@ W_theta = np.sin(theta)
 W2D = np.sin(theta_grid)
 W2D_norm = W2D / np.sum(W2D)
 
+# getting dimensionality
+state_shape = (len(theta), len(phi)) # snapshot shape used globally
+n_points_globally = len(theta) * len(phi) # number of points in grid
+
 # ---------------------------------------------------------
 # TEMPORAL PARAMETERS
 # ---------------------------------------------------------
 
-# note: times relative to start of synthetic time series (i.e. t=0)
-t_start = 0.0 # start time
-t_end = 29.5 # end time
+# Time information consistent with resolution output
+f = h5py.File((f'{CHAOS_RESOL_DIR}/CHAOS_Resol_1997_2026_0806_SV.h5'),"r")
+
+# getting time parameters
+# array of time steps (decimal year)
+times_res = np.asarray(f['tp'])
+# value of temporal sampling spacing
+dt_res = np.asarray(f["dt"])
+# number of time points in total
+Nt_res = np.asarray(f["n_tp"])
+
+'''print(f"The resolved output format spans {np.min(times_res)}-{np.max(times_res)} \n\
+With a gauss coefficient knot spacing of {dt_res} years \n\
+Resulting in {Nt_res} time sample points per time series")
+'''
+f.close()
+
+# converting to mjd (to withdraw from ChaosMagPy)
+times_res_mjd = cp.dyear_to_mjd(times_res)
+
+# getting relative times (for synthetic consistency)
+times_res_relative = times_res - times_res[0]
+
+# record length and fourier resolution
+t_start = times_res[0] # start time
+t_end = times_res[-1] # end time
 t_record = t_end - t_start # record length
 f_bin = 1 / t_record # associatied fourier resolution
 
-dt_years = 0.2   # 6-month sampling (same as CHAOS independent information)
-f_sample = 1 / dt_years    # samples per year
-
-# getting decimal year and julian date formats
-times_dyear = np.arange(t_start, t_end, dt_years)
-n_times = int(len(times_dyear)) # number of total samples
-
 # ---------------------------------------------------------
-# HIGH QUALITY RECORD DEFINITION
+# DMD INPUT RECORD DEFINITION
 # ---------------------------------------------------------
 
-# important events and reliable times recorded
-t_r_start = 1997.1
-times_mjd2000 = cp.data_utils.dyear_to_mjd(times_dyear+t_r_start)
-dt_years = 0.2
+# real start of data input for DMD
+t_dmd_start = 2000.0
+t_dmd_end = 2026.0
 
-notable_times_raw = {
-    "CHAMP Start (2000/08)": 2000 + 8/12,
-    "CHAMP End (2010/09)": 2010 + 9/12,
-    "Swarm Start (2013/11)": 2013 + 11/12,
-    "(2026/01)": 2026 
-}
+times_used_relative = np.arange(0, 53, 1) * 0.5
+times_used = t_dmd_start + times_used_relative
+times_evaluate_ideal_phasors = times_used - times_res[0]
+times_used_mjd = cp.dyear_to_mjd(times_used)
 
-notable_times_relative = {}
-notable_times_aspline = {}
+# ---------------------------------------------------------
+# TIME DOWNSAMPLING
+# ---------------------------------------------------------
 
-for event in notable_times_raw:
-    notable_times_relative[event] = \
-        (notable_times_raw[event] - t_r_start)
-    
-# 'good' record mask
-# absolute decimal-year time associated with each Gauss time step
-times_absolute = t_r_start + times_dyear
-
-# reliable record limits
-good_record_start = notable_times_raw["CHAMP Start (2000/08)"]
-good_record_end = notable_times_raw["(2026/01)"]
-
-# indices lying within the good record
-good_record_idx = np.where(
-    (times_absolute >= good_record_start)
-    & (times_absolute <= good_record_end)
-)[0]
-
-# start/end indices and equivalent slice
-good_record_start_idx = good_record_idx[0]
-good_record_end_idx = good_record_idx[-1]
-
-good_record_slice = slice(
-    good_record_start_idx,
-    good_record_end_idx + 1
-)
+dt_sample = times_used[1] - times_used[0]
+f_sample = 1/dt_sample
 
 
 # ---------------------------------------------------------
@@ -161,7 +152,7 @@ good_record_slice = slice(
 # ---------------------------------------------------------
 
 
-scale_file = Path(FELIX_DIR) / "mode_amplitude_scalings_v1.pkl"
+scale_file = Path(FELIX_DIR) / "amplitude_scalings.pkl"
 
 with open(scale_file, "rb") as file:
     mode_amp_scalings = pickle.load(file)
