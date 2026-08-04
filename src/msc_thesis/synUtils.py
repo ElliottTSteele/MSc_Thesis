@@ -57,13 +57,13 @@ with h5py.File(file_path, "r") as cov_file:
     knots = np.asarray(cov_file["knots"])
     n_spl =  np.asarray(cov_file["n_spl"])
     n_m =  np.asarray(cov_file["n_m"])
-    nmax =  np.asarray(cov_file["nmax"])
+    nmax_cov =  np.asarray(cov_file["nmax"])
     order =  np.asarray(cov_file["order"])
 
 
-    print(f"There are {len(knots)} knots")
+    '''print(f"There are {len(knots)} knots")
     print(f"There are: {n_spl} splines")
-    print(f"There are: {nmax} degrees")
+    print(f"There are: {nmax_cov} degrees")'''
 
 P = R_Read_In("P", "MF")
 
@@ -352,6 +352,10 @@ def Lowes_Degree_PSD_All_Degrees(gnm, a, r, f_sample, nmax):
         axis=0,
     )
 
+    # getting rid of everything beyond nyquist
+    nyquist_mask = (frequencies <= 0.5)
+    degree_psds = degree_psds[:, nyquist_mask]
+
     return degree_psds, frequencies
 
 # ---------------------------------------------------------
@@ -382,7 +386,7 @@ def CHAOS_Full_SV_Record_Obtain(model_version="CHAOS-8.6.mat", nmax=15):
     model = cp.load_CHAOS_matfile(f'{CHAOS_DIR}/{model_version}')
 
     # printing full unbounded extent of CHAOS8.6 model (decimal year)
-    print('Full CHAOS-8.6 timespan is:', cp.mjd_to_dyear(model.model_tdep.breaks[[0, -1]]))
+    # print('Full CHAOS-8.6 timespan is:', cp.mjd_to_dyear(model.model_tdep.breaks[[0, -1]]))
 
     # gauss coeffs in natural order, i.e. g(n,m): g(1,0), g(1, 1), h(1, 1), ...
     gnm_chaos = model.synth_coeffs_tdep(times_used_mjd, nmax=nmax, deriv=1)  # shape: (10, 224)
@@ -392,6 +396,55 @@ def CHAOS_Full_SV_Record_Obtain(model_version="CHAOS-8.6.mat", nmax=15):
 # ---------------------------------------------------------
 # LOADING SYNTHETIC DATA
 # ---------------------------------------------------------
+
+# basic mode i loading code - assumes SV wanted
+def Component_Load_MF(mode_number, directory=FELIX_DIR, nmax = 15):
+    # select a mode number and corresponding file
+    file = h5py.File(f'{directory}/mode_surface_including_gnm_{mode_number}.h5',"r")
+
+    # Converts V_alfven (arbitrary) to nT (arbitrary)
+    va_to_nt_arbitrary = (v_alfven * np.sqrt(mu_0 * rho) * 1e9) 
+
+    # load all components, transpose to lat, long
+
+    # gauss coefficient (magnetic scalar potential) phasors
+    gnm_60 = va_to_nt_arbitrary * (np.asarray(file["gnmr"]) +\
+         1j*np.asarray(file["gnmi"])) # [nT, arbitrary]
+    gnm = Truncate_Gauss_Coeffs(gnm_60, tmax=nmax)
+
+    # Br
+    #br = va_to_nt_arbitrary * (np.asarray(file["brr"]).T +\
+    #     1j*np.asarray(file["bri"]).T) # [nT, arbitrary]
+
+    # u_theta
+    #utheta = np.asarray(file["uthetar"]).T +\
+    #    1j*np.asarray(file["uthetai"]).T # [V_alfven, arbitrary]
+    # u_phi
+    #uphi = np.asarray(file["uphir"]).T +\
+    #    1j*np.asarray(file["uphii"]).T # [V_alfven, arbitrary]
+
+    # loading in true period and decay rate
+    omega = file["omega"][()] # angular frequency (rad/year)
+    #sigma = file["sigma"][()] # annual decay rate (fractional decay/year)
+
+    #eigenvalue_decaying = sigma + 1j * omega # with decay
+
+    eigenvalue = 0 + 1j * omega # storing as eigenvalue - NO DECAY
+
+    file.close() # close file
+
+    mode_i_info = {
+        "mode_number": mode_number,
+        "gnm": gnm,
+        #"sv": eigenvalue * br,
+        #"utheta": utheta,
+        #"uphi": uphi,
+        "eigenvalue": eigenvalue,
+        #"eigenvalue_decaying": eigenvalue_decaying
+    }
+
+    # returns all basic components for the mode
+    return mode_i_info
 
 # basic mode i loading code - assumes SV wanted
 def Component_Load_SV(mode_number, directory=FELIX_DIR, nmax = 15):
@@ -409,21 +462,21 @@ def Component_Load_SV(mode_number, directory=FELIX_DIR, nmax = 15):
     gnm = Truncate_Gauss_Coeffs(gnm_60, tmax=nmax)
 
     # Br
-    br = va_to_nt_arbitrary * (np.asarray(file["brr"]).T +\
-         1j*np.asarray(file["bri"]).T) # [nT, arbitrary]
+    #br = va_to_nt_arbitrary * (np.asarray(file["brr"]).T +\
+    #     1j*np.asarray(file["bri"]).T) # [nT, arbitrary]
 
     # u_theta
-    utheta = np.asarray(file["uthetar"]).T +\
-        1j*np.asarray(file["uthetai"]).T # [V_alfven, arbitrary]
+    #utheta = np.asarray(file["uthetar"]).T +\
+    #    1j*np.asarray(file["uthetai"]).T # [V_alfven, arbitrary]
     # u_phi
-    uphi = np.asarray(file["uphir"]).T +\
-        1j*np.asarray(file["uphii"]).T # [V_alfven, arbitrary]
+    #uphi = np.asarray(file["uphir"]).T +\
+    #    1j*np.asarray(file["uphii"]).T # [V_alfven, arbitrary]
 
     # loading in true period and decay rate
     omega = file["omega"][()] # angular frequency (rad/year)
-    sigma = file["sigma"][()] # annual decay rate (fractional decay/year)
+    #sigma = file["sigma"][()] # annual decay rate (fractional decay/year)
 
-    eigenvalue_decaying = sigma + 1j * omega # with decay
+    #eigenvalue_decaying = sigma + 1j * omega # with decay
 
     eigenvalue = 0 + 1j * omega # storing as eigenvalue - NO DECAY
 
@@ -432,11 +485,11 @@ def Component_Load_SV(mode_number, directory=FELIX_DIR, nmax = 15):
     mode_i_info = {
         "mode_number": mode_number,
         "gnm": eigenvalue * gnm,
-        "sv": eigenvalue * br,
-        "utheta": utheta,
-        "uphi": uphi,
+        #"sv": eigenvalue * br,
+        #"utheta": utheta,
+        #"uphi": uphi,
         "eigenvalue": eigenvalue,
-        "eigenvalue_decaying": eigenvalue_decaying
+        #"eigenvalue_decaying": eigenvalue_decaying
     }
 
     # returns all basic components for the mode
@@ -458,8 +511,46 @@ def G_Time_Series_Eval(G_mode_i, eigenvalue, times=times_evaluate_ideal_phasors)
     return mode_i_contribution_array
 
 
+def Guest_Wave_Scale(mode_number, h5_file, nmax, mode_amp_scalings=mode_amp_scalings):
+
+    guest_num = mode_number
+
+    guest_info = mode_number.split("_")
+    g_num, g_type, g_period_raw = guest_info[-3:]
+    candidate_num = g_num[1:] # getting rid of g flag
+    candidate_amplitude_scaler = mode_amp_scalings[candidate_num]
+
+    # amplitude scaling to have power = candidate target
+    guest_spline_path = f"mode_{guest_num}/without_decay"
+    candidate_spline_path = f"mode_{candidate_num}/without_decay"
+
+    gnm_spline_guest = np.asarray(h5_file[guest_spline_path][()])
+    gnm_spline_candidate = np.asarray(h5_file[candidate_spline_path][()])
+
+    gnm_guest_resolved = H_sv @ (gnm_spline_guest)
+    gnm_guest_resolved = Truncate_Gauss_Coeffs(gnm_guest_resolved, tmax=nmax)
+
+    
+    gnm_candidate_resolved = H_sv @ (
+        candidate_amplitude_scaler * gnm_spline_candidate
+    )
+    gnm_candidate_resolved = Truncate_Gauss_Coeffs(gnm_candidate_resolved, tmax=nmax)
+
+    power_candidate = np.sum(Lowes_Degree_PSD_All_Degrees(gnm_candidate_resolved, a=r_earth,
+                                                           r=r_cmb, f_sample=f_sample, nmax=nmax)[0])
+    power_guest = np.sum(Lowes_Degree_PSD_All_Degrees(gnm_guest_resolved, a=r_earth,
+                                                           r=r_cmb, f_sample=f_sample, nmax=nmax)[0])
+
+    guest_amplitude_scaler = np.sqrt(power_candidate/power_guest)
+    mode_amp_scalings[guest_num] = guest_amplitude_scaler
+
+    return(mode_amp_scalings)
+    
+    
+
 # define function - pulls out signals necessary + input mode info for comparison
-def Synthetic_Full_SV_Record_Obtain(mode_numbers, times=times_used_relative, scale_flag=True, nmax=15):
+def Synthetic_Full_SV_Record_Obtain(mode_numbers, times=times_evaluate_ideal_phasors, 
+                                    scale_flag=True, nmax=15, mode_amp_scalings=mode_amp_scalings):
     # for each mode - forming the ideal input record and withdrawing precomputed resolved record
     spline_path = Path(FELIX_DIR) / "R_splines_arbitrary.h5"
     synthetic_suite_info = {}
@@ -468,6 +559,11 @@ def Synthetic_Full_SV_Record_Obtain(mode_numbers, times=times_used_relative, sca
 
     with h5py.File(spline_path, "r") as h5_file:
         for mode_number in mode_numbers:
+   
+
+            # if dealing with guest mode
+            if mode_number[0] == 'g':
+                mode_amp_scalings = Guest_Wave_Scale(mode_number, h5_file, nmax, mode_amp_scalings)
 
             # getting amplitude scaler
             if scale_flag:
@@ -484,7 +580,7 @@ def Synthetic_Full_SV_Record_Obtain(mode_numbers, times=times_used_relative, sca
             gnm_mode_ideal = G_Time_Series_Eval(
                 ideal_gnm_phasor,
                 eigenvalue,
-                # need to use the specific 'ideal times evaluate' to get correct phase
+                times=times
             )
 
             # 2) getting the resolved gauss coefficient time series

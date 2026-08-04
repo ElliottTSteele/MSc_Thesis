@@ -156,3 +156,14 @@ scale_file = Path(FELIX_DIR) / "amplitude_scalings.pkl"
 
 with open(scale_file, "rb") as file:
     mode_amp_scalings = pickle.load(file)
+
+# ---------------------------------------------------------
+# MATCH SIMILARITY THRESHOLDS
+# ---------------------------------------------------------
+
+period_frac_threshold = 0.25
+
+match_file = Path(FELIX_DIR) / "match_metrics.pkl"
+
+with open(match_file, "rb") as file:
+    similarity_thresholds = pickle.load(file)
