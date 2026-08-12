@@ -11,6 +11,7 @@ sys.path.append(str(PROJECT_ROOT))
 DATA_DIR = PROJECT_ROOT / "data"
 # outputs
 FIG_DIR = PROJECT_ROOT/"figures"
+RESULT_DIR = PROJECT_ROOT/"results"
 # specific data directories
 FELIX_DIR = DATA_DIR / "modes_surface"
 CHAOS_DIR = DATA_DIR / "chaos_mats"

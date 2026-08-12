@@ -355,6 +355,7 @@ def Lowes_Degree_PSD_All_Degrees(gnm, a, r, f_sample, nmax):
     # getting rid of everything beyond nyquist
     nyquist_mask = (frequencies <= 0.5)
     degree_psds = degree_psds[:, nyquist_mask]
+    frequencies = frequencies[nyquist_mask]
 
     return degree_psds, frequencies
 
@@ -546,61 +547,72 @@ def Guest_Wave_Scale(mode_number, h5_file, nmax, mode_amp_scalings=mode_amp_scal
 
     return(mode_amp_scalings)
     
-    
+
+
+def Load_A_Mode_SV(mode_number, nmax, times, scale_flag=True, mode_amp_scalings=mode_amp_scalings):
+
+    spline_path = Path(FELIX_DIR) / "R_splines_arbitrary.h5"
+
+
+    # with spline file open
+    with h5py.File(spline_path, "r") as h5_file:
+        # if dealing with guest mode
+        if mode_number[0] == 'g':
+            mode_amp_scalings = Guest_Wave_Scale(mode_number, h5_file, nmax, mode_amp_scalings)
+
+        # getting amplitude scaler
+        if scale_flag:
+            amplitude_scaler = mode_amp_scalings[mode_number]
+        else:
+            amplitude_scaler = 1
+
+
+        # 1) getting ideal mode gauss coefficient time series
+        mode_data = Component_Load_SV(mode_number, nmax=nmax)
+        eigenvalue = mode_data["eigenvalue"]
+        ideal_gnm_phasor = amplitude_scaler * mode_data["gnm"]
+        true_period = 2.0 * np.pi / np.abs(eigenvalue.imag)
+        gnm_mode_ideal = G_Time_Series_Eval(
+            ideal_gnm_phasor,
+            eigenvalue,
+            times=times
+        )
+
+        # 2) getting the resolved gauss coefficient time series
+        dataset_name = f"mode_{mode_number}/without_decay"
+        gnm_spline = np.asarray(h5_file[dataset_name][()])
+        gnm_mode_resolved = H_sv @ (
+            amplitude_scaler * gnm_spline
+        )
+        gnm_mode_resolved = Truncate_Gauss_Coeffs(gnm_mode_resolved, tmax=nmax)
+
+        # store it all for future reference
+        syn_mode_info = {
+            "true_period": float(true_period),
+            "true_eigenvalue": eigenvalue,
+            "gnm_phasor": ideal_gnm_phasor,
+            "gnm_ideal": gnm_mode_ideal,
+            "gnm_resolved": gnm_mode_resolved,
+        }
+
+        return(syn_mode_info)
+
 
 # define function - pulls out signals necessary + input mode info for comparison
 def Synthetic_Full_SV_Record_Obtain(mode_numbers, times=times_evaluate_ideal_phasors, 
                                     scale_flag=True, nmax=15, mode_amp_scalings=mode_amp_scalings):
     # for each mode - forming the ideal input record and withdrawing precomputed resolved record
-    spline_path = Path(FELIX_DIR) / "R_splines_arbitrary.h5"
+
     synthetic_suite_info = {}
     gnm_total_ideal_list = []
     gnm_total_resolved_list = []
 
-    with h5py.File(spline_path, "r") as h5_file:
-        for mode_number in mode_numbers:
-   
+    for mode_number in mode_numbers:
 
-            # if dealing with guest mode
-            if mode_number[0] == 'g':
-                mode_amp_scalings = Guest_Wave_Scale(mode_number, h5_file, nmax, mode_amp_scalings)
-
-            # getting amplitude scaler
-            if scale_flag:
-                amplitude_scaler = mode_amp_scalings[mode_number]
-            else:
-                amplitude_scaler = 1
-
-
-            # 1) getting ideal mode gauss coefficient time series
-            mode_data = Component_Load_SV(mode_number, nmax=nmax)
-            eigenvalue = mode_data["eigenvalue"]
-            ideal_gnm_phasor = amplitude_scaler * mode_data["gnm"]
-            true_period = 2.0 * np.pi / np.abs(eigenvalue.imag)
-            gnm_mode_ideal = G_Time_Series_Eval(
-                ideal_gnm_phasor,
-                eigenvalue,
-                times=times
-            )
-
-            # 2) getting the resolved gauss coefficient time series
-            dataset_name = f"mode_{mode_number}/without_decay"
-            gnm_spline = np.asarray(h5_file[dataset_name][()])
-            gnm_mode_resolved = H_sv @ (
-                amplitude_scaler * gnm_spline
-            )
-            gnm_mode_resolved = Truncate_Gauss_Coeffs(gnm_mode_resolved, tmax=nmax)
-
-            # store it all for future reference
-            synthetic_suite_info[mode_number] = {
-                "true_period": float(true_period),
-                "true_eigenvalue": eigenvalue,
-                "gnm_phasor": ideal_gnm_phasor,
-                "gnm_ideal": gnm_mode_ideal,
-                "gnm_resolved": gnm_mode_resolved,
-            }
-            gnm_total_ideal_list.append(gnm_mode_ideal)
-            gnm_total_resolved_list.append(gnm_mode_resolved)
+        mode_info = Load_A_Mode_SV(mode_number, nmax, times, scale_flag=scale_flag)
+        gnm_total_ideal_list.append(mode_info["gnm_ideal"])
+        gnm_total_resolved_list.append(mode_info["gnm_resolved"])
+        synthetic_suite_info[mode_number] = mode_info
 
     # stacking lists to get cumulative wave signals
     gnm_total_ideal = np.sum(np.asarray(gnm_total_ideal_list), axis=0)
@@ -705,6 +717,36 @@ def Non_Wave_Spectral_Infill(gnm_chaos, gnm_syn, nmax=15, dt_sample=dt_sample, s
         g_noise[:, n_slice] *= n_factor
 '''
     return(g_noise)
+
+# function to calculate the total lowes power of a phasor over the record
+def Total_Power_Over_Record(input, nmax, eigenvalue=None, ideal=False):
+
+    has_complex_values = np.any(np.iscomplex(input))
+
+    # in the case of complex values, is phasor:
+    if has_complex_values:
+
+        gnm_phasor = input
+
+        # if it is an 'ideal' synthetic phasor - evaluate on shifted record
+        if ideal:
+            times = times_evaluate_ideal_phasors
+        else:
+            times = times_used_relative
+
+        gnm_ts = G_Time_Series_Eval(gnm_phasor, eigenvalue, times=times)
+
+    # if not, assume gauss time series
+    else:
+
+        gnm_ts = input
+
+    p_arr, _ = Lowes_Degree_PSD_All_Degrees(gnm_ts, a=r_earth, r=r_cmb, f_sample=f_sample, nmax=nmax)
+
+    power = np.sum(p_arr)
+
+    return(power)
+
 
 # ---------------------------------------------------------
 # GENERIC VISUALISATION CODE

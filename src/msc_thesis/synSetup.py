@@ -132,19 +132,17 @@ f_bin = 1 / t_record # associatied fourier resolution
 
 # real start of data input for DMD
 t_dmd_start = 2000.0
-t_dmd_end = 2026.0
+t_dmd_end = 2024.0
+dt_sample = 0.5
+f_sample = 1/dt_sample
+times_used = np.arange(t_dmd_start, t_dmd_end+0.5, dt_sample)
+times_used_relative = times_used - t_dmd_start
 
-times_used_relative = np.arange(0, 53, 1) * 0.5
-times_used = t_dmd_start + times_used_relative
 times_evaluate_ideal_phasors = times_used - times_res[0]
 times_used_mjd = cp.dyear_to_mjd(times_used)
 
-# ---------------------------------------------------------
-# TIME DOWNSAMPLING
-# ---------------------------------------------------------
+fourier_bin_width = 1/( t_dmd_end - t_dmd_start)
 
-dt_sample = times_used[1] - times_used[0]
-f_sample = 1/dt_sample
 
 
 # ---------------------------------------------------------
@@ -162,6 +160,7 @@ with open(scale_file, "rb") as file:
 # ---------------------------------------------------------
 
 period_frac_threshold = 0.25
+frequency_error_threshold = fourier_bin_width/2
 
 match_file = Path(FELIX_DIR) / "match_metrics.pkl"
 
