@@ -1,14 +1,15 @@
-__pycache__/
-.ipynb_checkpoints/
+# Deprecated and large local data
+Deprecated_files/
 data/
-results/
+
+# Generated figures and outputs
 figures/
 outputs/
 
 # VS Code local settings
 .vscode/
 
-# Logs / temporary outputs
+# Logs and temporary outputs
 *.log
 *_log.csv
 
@@ -28,8 +29,12 @@ __pycache__/
 *.nc
 *.pkl
 
-# Videos / animations
+# Videos and animations
 *.mp4
 *.gif
 *.avi
 *.mov
+
+# Always retain final results, including otherwise ignored formats
+!results/
+!results/**
