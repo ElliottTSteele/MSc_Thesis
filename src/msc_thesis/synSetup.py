@@ -160,7 +160,7 @@ with open(scale_file, "rb") as file:
 # ---------------------------------------------------------
 
 period_frac_threshold = 0.25
-frequency_error_threshold = fourier_bin_width/2
+# >refrequency_error_threshold = 10*fourier_bin_width
 
 match_file = Path(FELIX_DIR) / "match_metrics.pkl"
 

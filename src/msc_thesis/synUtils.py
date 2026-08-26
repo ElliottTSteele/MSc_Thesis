@@ -634,7 +634,7 @@ def Synthetic_Full_SV_Record_Obtain(mode_numbers, times=times_evaluate_ideal_pha
 
 from scipy.signal import firwin2, lfilter
 
-def Non_Wave_Spectral_Infill(gnm_chaos, gnm_syn, nmax=15, dt_sample=dt_sample, seed=42):
+def Non_Wave_Spectral_Infill(gnm_chaos, gnm_syn, nmax=15, dt_sample=dt_sample, seed=42, n_taps=61):
 
     Nt, Ng = np.shape(gnm_chaos)
 
@@ -685,14 +685,15 @@ def Non_Wave_Spectral_Infill(gnm_chaos, gnm_syn, nmax=15, dt_sample=dt_sample, s
             frequencies = np.append(frequencies, f_nyquist)
             amp_gains = np.append(amp_gains, amp_gains[-1])
 
+
         taps = firwin2(
-            numtaps=101,
+            numtaps=n_taps,
             freq=frequencies,
             gain=amp_gains,
             fs=f_sample,
         )
 
-        burn_in = 3 * 101
+        burn_in = n_taps - 1
         white = rng.normal(size=Nt + burn_in)
         noise = lfilter(taps, 1.0, white)[burn_in:]
 

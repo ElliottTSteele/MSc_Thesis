@@ -13,7 +13,7 @@ import h5py
 from matplotlib import cm
 from matplotlib.colors import BoundaryNorm
 from matplotlib.lines import Line2D
-from matplotlib.patches import Rectangle
+from matplotlib.patches import Patch, Rectangle
 from scipy.signal import (
     butter,
     buttord,
@@ -326,7 +326,7 @@ def Build_BOPDMD(svd_rank, bopdmd=False, bopdmd_params=None):
                 svd_rank=svd_rank,
                 varpro_opts_dict={
                     "maxiter": 500,
-                    "tol": 0.1,
+                    "tol": 0.00001,
                     "verbose": False,
                 },
             )
@@ -1099,12 +1099,13 @@ def Match_Input_Output_Modes(syn_suite_info, recovered_modes, nmax, syn_record=T
     correlation_grid[~np.isfinite(correlation_grid)] = 0.0
 
     # 2) zero out ineligebile matches based on period
-    for j, input_frequency in enumerate(input_frequencies):
+    for j, input_period in enumerate(input_periods):
 
-        low_f = max(input_frequency - frequency_error_threshold, 0.01)
-        high_f = input_frequency + frequency_error_threshold
+        period_error_threshold = 0.3 * input_period
+        low_t = max(input_period - period_error_threshold, 0.01)
+        high_t = input_period + period_error_threshold
 
-        ineligible_output_mask = (output_frequencies < low_f) | (output_frequencies > high_f)
+        ineligible_output_mask = (output_periods < low_t) | (output_periods > high_t)
 
         correlation_grid[ineligible_output_mask, j] = 0
 
@@ -1465,6 +1466,15 @@ def Perform_DMD_on_Record(syn_suite_info, record_physical, nmax, svd_rank, dmd_s
 def Pipeline_Run(record_dict_global, syn_suite_info_global, dmd_settings, 
                  nmax, svd_rank, ensemble_settings, syn_record=True,
                  total_unmatched_period_return=False):
+    """Run DMD on the supplied records and optional perturbation ensemble.
+
+    For an enabled ensemble with a fractional SVD energy threshold, the
+    selected unperturbed record is deferred until after the ensemble. Its
+    explicit integer rank is the ceiling of the median effective rank from
+    every successful ensemble DMD run, including runs with zero mode matches.
+    DMD failures are excluded. The selected record's results store the rank
+    choice under ``rank_selection``.
+    """
 
     # getting the relevant degree projection operator
     A_r = Truncate_Gauss_Coeffs(A_15_r, tmax=nmax)
@@ -1475,11 +1485,25 @@ def Pipeline_Run(record_dict_global, syn_suite_info_global, dmd_settings,
         record_dict[record_key] = Truncate_Gauss_Coeffs(record_dict_global[record_key],
                                                         tmax=nmax)
 
-    results_dict = {}
+    # Pre-population preserves the input record ordering when the selected
+    # unperturbed record is deferred until after the ensemble.
+    results_dict = {record_key: None for record_key in record_dict}
     record_for_ensemble = ensemble_settings["record_for_ensemble"]
+    ensemble_flag = ensemble_settings["ensemble_flag"]
+    use_ensemble_median_rank = (
+        ensemble_flag
+        and isinstance(svd_rank, (float, np.floating))
+        and 0 < svd_rank < 1
+    )
 
     # for each record stored
     for record_key in record_dict:
+
+        # A fractional rank is an energy threshold. For an ensemble run, the
+        # perturbed realisations must be fitted first so that the selected
+        # unperturbed record can use their median effective integer rank.
+        if use_ensemble_median_rank and record_key == record_for_ensemble:
+            continue
 
         # pulling out record specified
         record_used = record_dict[record_key]
@@ -1496,8 +1520,6 @@ def Pipeline_Run(record_dict_global, syn_suite_info_global, dmd_settings,
 
     
     # Running perturbation ensemble
-    ensemble_flag = ensemble_settings["ensemble_flag"]
-
     if ensemble_flag:
 
         total_unmatched_periods = []
@@ -1534,6 +1556,62 @@ def Pipeline_Run(record_dict_global, syn_suite_info_global, dmd_settings,
                 if type(unmatched_periods) == list:
 
                     total_unmatched_periods += unmatched_periods
+
+        if use_ensemble_median_rank:
+            ensemble_effective_ranks = []
+            for ensemble_result in results_dict["ensemble"].values():
+                # Match failures still produce a result dictionary and are
+                # included. Only DMD failures, stored as None, are excluded.
+                if not ensemble_result:
+                    continue
+                effective_rank = ensemble_result.get("effective_rank")
+                if (
+                    effective_rank is None
+                    or not np.isfinite(effective_rank)
+                    or effective_rank <= 0
+                    or not float(effective_rank).is_integer()
+                ):
+                    raise ValueError(
+                        "Each successful ensemble DMD run must provide a "
+                        "positive integer effective_rank."
+                    )
+                ensemble_effective_ranks.append(int(effective_rank))
+
+            if not ensemble_effective_ranks:
+                raise RuntimeError(
+                    "Cannot select an unperturbed DMD rank because every "
+                    "ensemble DMD run failed."
+                )
+
+            ensemble_effective_rank_median = float(np.median(
+                ensemble_effective_ranks
+            ))
+            unperturbed_rank_used = int(np.ceil(
+                ensemble_effective_rank_median
+            ))
+
+            record_used = record_dict[record_for_ensemble]
+            record_physical = A_r @ record_used.T
+            record_match_results, _, rec_modes_returned = (
+                Perform_DMD_on_Record(
+                    syn_suite_info_global,
+                    record_physical,
+                    nmax,
+                    unperturbed_rank_used,
+                    dmd_settings,
+                    syn_record,
+                    record_key=record_for_ensemble,
+                )
+            )
+            if record_match_results is not None:
+                record_match_results["rank_selection"] = {
+                    "ensemble_svd_rank": float(svd_rank),
+                    "ensemble_effective_rank_median": (
+                        ensemble_effective_rank_median
+                    ),
+                    "unperturbed_rank_used": unperturbed_rank_used,
+                }
+            results_dict[record_for_ensemble] = record_match_results
     else:
         
         results_dict["ensemble"] = False
@@ -1559,6 +1637,12 @@ def Percentile_Summary(array, axis=0, p=5):
 
 # define a function to process ensemble case into median
 def Ensemble_To_Median(results_dict, syn_suite_info):
+    """Add ensemble percentile summaries to a pipeline results dictionary.
+
+    The effective-rank ``value`` remains the raw ensemble median. When the
+    unperturbed record used an ensemble-derived rank, the ceiling rank that
+    was actually used is stored separately as ``unperturbed_rank_used``.
+    """
     
     if results_dict["ensemble"]:
         suite_ensemble_result = {}
@@ -1641,6 +1725,32 @@ def Ensemble_To_Median(results_dict, syn_suite_info):
         results_dict["median"]["effective_rank"]["value"] = effective_rank_median
         results_dict["median"]["effective_rank"]["p05"] = effective_rank_p05
         results_dict["median"]["effective_rank"]["p95"] = effective_rank_p95
+
+        rank_selection = None
+        for record_result in results_dict.values():
+            if isinstance(record_result, dict) and isinstance(
+                record_result.get("rank_selection"),
+                dict,
+            ):
+                if rank_selection is not None:
+                    raise ValueError(
+                        "Multiple unperturbed ensemble rank selections were "
+                        "found in results_dict."
+                    )
+                rank_selection = record_result["rank_selection"]
+
+        if rank_selection is not None:
+            stored_median = rank_selection[
+                "ensemble_effective_rank_median"
+            ]
+            if not np.isclose(stored_median, effective_rank_median):
+                raise ValueError(
+                    "Stored ensemble effective-rank median is inconsistent "
+                    "with the ensemble results."
+                )
+            results_dict["median"]["effective_rank"][
+                "unperturbed_rank_used"
+            ] = rank_selection["unperturbed_rank_used"]
     
         # for each mode_key in synthetic suite
         for mode_key in syn_suite_info:
@@ -1848,8 +1958,6 @@ def Rank_Degree_Heatmap(record_dict_global, syn_suite_info_global,
             chosen_rank_degree=chosen_rank_degree,
         )
     )
-
-    plt.show()
 
     return heatmap_figure, heatmap_axis, heatmap_colourbar
 
@@ -2533,19 +2641,19 @@ def Plot_Hankel_Embedding_Performance(
     hankel_d_values,
     mode_recovery_performance,
     syn_suite_info,
-    non_perturbed_match_counts,
+    ensemble_match_counts,
     figure_width,
     chosen_embedding_d=None,
     x_margin_fraction=0.05,
-    non_perturbed_record_label="Resolved",
 ):
     """Plot per-mode recovery metrics against Hankel embedding dimension.
 
-    The first three panels show threshold-relative spatial quality,
-    fractional period error, and ensemble recovery count. The fourth shows
-    the total number of input modes recovered from the selected record
-    without perturbations. Embedding dimension is the shared vertical axis
-    and increases downwards from zero.
+    The first two panels show the conditional ensemble median and p05--p95
+    range for threshold-relative spatial quality and fractional period error.
+    The third shows per-mode ensemble recovery count. The fourth shows the
+    ensemble median and p05--p95 range for the total number of modes
+    recovered. Embedding dimension is the shared vertical axis and increases
+    downwards from zero.
     """
 
     hankel_d_values = np.asarray(hankel_d_values, dtype=float)
@@ -2553,16 +2661,8 @@ def Plot_Hankel_Embedding_Performance(
         raise ValueError("hankel_d_values must be a non-empty 1D sequence.")
     if not np.all(np.isfinite(hankel_d_values)):
         raise ValueError("hankel_d_values must contain only finite values.")
-    if np.min(hankel_d_values) != 0:
-        raise ValueError("hankel_d_values must include 0 as its minimum.")
     if x_margin_fraction < 0:
         raise ValueError("x_margin_fraction must be non-negative.")
-    if not isinstance(non_perturbed_record_label, str) or not (
-        non_perturbed_record_label.strip()
-    ):
-        raise ValueError(
-            "non_perturbed_record_label must be a non-empty string."
-        )
     if chosen_embedding_d is not None:
         if not np.isfinite(chosen_embedding_d):
             raise ValueError("chosen_embedding_d must be finite or None.")
@@ -2576,39 +2676,65 @@ def Plot_Hankel_Embedding_Performance(
         (
             "spatial_quality",
             "Threshold-relative\nspatial similarity",
+            True,
         ),
         (
             "match_period_errors",
             "Fractional\nperiod error",
+            True,
         ),
         (
             "runs_with_mode_match",
             "Ensemble recovery\ncount",
+            False,
         ),
     )
 
     mode_keys = list(syn_suite_info.keys())
-    non_perturbed_match_counts = np.asarray(
-        non_perturbed_match_counts,
-        dtype=float,
+    required_percentiles = ("p05", "median", "p95")
+
+    if not isinstance(ensemble_match_counts, dict):
+        raise TypeError(
+            "ensemble_match_counts must contain p05, median, and p95 arrays."
+        )
+    missing_match_percentiles = (
+        set(required_percentiles) - set(ensemble_match_counts)
     )
-    if non_perturbed_match_counts.shape != hankel_d_values.shape:
-        raise ValueError(
-            "non_perturbed_match_counts has shape "
-            f"{non_perturbed_match_counts.shape}; expected "
-            f"{hankel_d_values.shape}."
+    if missing_match_percentiles:
+        raise KeyError(
+            "ensemble_match_counts is missing: "
+            f"{sorted(missing_match_percentiles)}."
         )
-    if not np.all(np.isfinite(non_perturbed_match_counts)):
-        raise ValueError(
-            "non_perturbed_match_counts must contain only finite values."
+    match_count_summary = {
+        percentile: np.asarray(
+            ensemble_match_counts[percentile],
+            dtype=float,
         )
+        for percentile in required_percentiles
+    }
+    for percentile, values in match_count_summary.items():
+        if values.shape != hankel_d_values.shape:
+            raise ValueError(
+                f"ensemble_match_counts['{percentile}'] has shape "
+                f"{values.shape}; expected {hankel_d_values.shape}."
+            )
+        if not np.all(np.isfinite(values)):
+            raise ValueError(
+                f"ensemble_match_counts['{percentile}'] must contain "
+                "only finite values."
+            )
+        if np.any((values < 0) | (values > len(mode_keys))):
+            raise ValueError(
+                "Ensemble match-count percentiles must lie between zero "
+                "and the number of input modes."
+            )
     if np.any(
-        (non_perturbed_match_counts < 0)
-        | (non_perturbed_match_counts > len(mode_keys))
+        (match_count_summary["p05"] > match_count_summary["median"])
+        | (match_count_summary["median"] > match_count_summary["p95"])
     ):
         raise ValueError(
-            "non_perturbed_match_counts must lie between zero and the "
-            "number of input modes."
+            "Ensemble match-count percentiles must satisfy "
+            "p05 <= median <= p95."
         )
 
     unknown_modes = set(mode_recovery_performance) - set(mode_keys)
@@ -2621,13 +2747,16 @@ def Plot_Hankel_Embedding_Performance(
     fig, axes = plt.subplots(
         nrows=1,
         ncols=4,
-        figsize=(figure_width, 0.55 * figure_width),
+        figsize=(figure_width, 0.4 * figure_width),
         sharey=True,
         squeeze=False,
     )
     axes = axes[0]
 
-    for axis, (metric_key, x_label) in zip(axes, metric_settings):
+    for axis, (metric_key, x_label, show_spread) in zip(
+        axes,
+        metric_settings,
+    ):
         finite_metric_values = []
 
         for mode_key in mode_keys:
@@ -2641,24 +2770,79 @@ def Plot_Hankel_Embedding_Performance(
                     f"Mode '{mode_key}' has no '{metric_key}' results."
                 )
 
-            metric_values = np.asarray(
-                mode_performance[metric_key],
-                dtype=float,
-            )
-            if metric_values.shape != hankel_d_values.shape:
-                raise ValueError(
-                    f"Mode '{mode_key}' metric '{metric_key}' has shape "
-                    f"{metric_values.shape}; expected "
-                    f"{hankel_d_values.shape}."
+            mode_colour = syn_suite_info[mode_key]["colour"]
+            if show_spread:
+                metric_summary = mode_performance[metric_key]
+                if not isinstance(metric_summary, dict):
+                    raise TypeError(
+                        f"Mode '{mode_key}' metric '{metric_key}' must "
+                        "contain p05, median, and p95 arrays."
+                    )
+                missing_percentiles = (
+                    set(required_percentiles) - set(metric_summary)
+                )
+                if missing_percentiles:
+                    raise KeyError(
+                        f"Mode '{mode_key}' metric '{metric_key}' is "
+                        f"missing {sorted(missing_percentiles)}."
+                    )
+                percentile_values = {
+                    percentile: np.asarray(
+                        metric_summary[percentile],
+                        dtype=float,
+                    )
+                    for percentile in required_percentiles
+                }
+                for percentile, values in percentile_values.items():
+                    if values.shape != hankel_d_values.shape:
+                        raise ValueError(
+                            f"Mode '{mode_key}' metric '{metric_key}' "
+                            f"percentile '{percentile}' has shape "
+                            f"{values.shape}; expected "
+                            f"{hankel_d_values.shape}."
+                        )
+                    finite_metric_values.extend(
+                        values[np.isfinite(values)]
+                    )
+                if np.any(
+                    (percentile_values["p05"] > percentile_values["median"])
+                    | (percentile_values["median"] > percentile_values["p95"])
+                ):
+                    raise ValueError(
+                        f"Mode '{mode_key}' metric '{metric_key}' must "
+                        "satisfy p05 <= median <= p95."
+                    )
+                axis.fill_betweenx(
+                    hankel_d_values,
+                    percentile_values["p05"],
+                    percentile_values["p95"],
+                    color=mode_colour,
+                    alpha=0.15,
+                    linewidth=0,
+                    zorder=1,
+                )
+                metric_values = percentile_values["median"]
+            else:
+                metric_values = np.asarray(
+                    mode_performance[metric_key],
+                    dtype=float,
+                )
+                if metric_values.shape != hankel_d_values.shape:
+                    raise ValueError(
+                        f"Mode '{mode_key}' metric '{metric_key}' has "
+                        f"shape {metric_values.shape}; expected "
+                        f"{hankel_d_values.shape}."
+                    )
+                finite_metric_values.extend(
+                    metric_values[np.isfinite(metric_values)]
                 )
 
-            finite_mask = np.isfinite(metric_values)
-            finite_metric_values.extend(metric_values[finite_mask])
             axis.plot(
                 metric_values,
                 hankel_d_values,
-                color=syn_suite_info[mode_key]["colour"],
+                color=mode_colour,
                 linewidth=1.5,
+                zorder=2,
             )
 
         if not finite_metric_values:
@@ -2668,14 +2852,15 @@ def Plot_Hankel_Embedding_Performance(
 
         metric_min = float(np.min(finite_metric_values))
         metric_max = float(np.max(finite_metric_values))
-        if metric_key == "match_period_errors":
-            metric_max = 0.2
         metric_range = metric_max - metric_min
         if metric_range == 0:
             margin = x_margin_fraction * max(abs(metric_min), 1.0)
         else:
             margin = x_margin_fraction * metric_range
-        axis.set_xlim(metric_min - margin, metric_max + margin)
+        if metric_key == "match_period_errors":
+            axis.set_xlim(0, 0.2)
+        else:
+            axis.set_xlim(metric_min - margin, metric_max + margin)
         axis.set_xlabel(x_label)
         axis.grid(
             True,
@@ -2691,24 +2876,30 @@ def Plot_Hankel_Embedding_Performance(
                 color="0.5",
                 linestyle="--",
                 linewidth=1.2,
-                zorder=1,
+                zorder=3,
             )
 
-    non_perturbed_axis = axes[3]
-    non_perturbed_axis.plot(
-        non_perturbed_match_counts,
+    match_count_axis = axes[3]
+    match_count_axis.fill_betweenx(
+        hankel_d_values,
+        match_count_summary["p05"],
+        match_count_summary["p95"],
+        color="black",
+        alpha=0.15,
+        linewidth=0,
+        zorder=1,
+    )
+    match_count_axis.plot(
+        match_count_summary["median"],
         hankel_d_values,
         color="black",
         linewidth=1.5,
+        zorder=2,
     )
-    non_perturbed_axis.set_xlim(0, len(mode_keys))
-    non_perturbed_axis.set_xticks(np.arange(len(mode_keys) + 1))
-    non_perturbed_axis.set_xlabel(
-        f"{non_perturbed_record_label.strip()} modes\n"
-        "recovered\n"
-        "(no perturbations)"
-    )
-    non_perturbed_axis.grid(
+    match_count_axis.set_xlim(0, len(mode_keys))
+    match_count_axis.set_xticks(np.arange(len(mode_keys) + 1))
+    match_count_axis.set_xlabel("Median modes\nrecovered")
+    match_count_axis.grid(
         True,
         which="major",
         linestyle=":",
@@ -2716,22 +2907,44 @@ def Plot_Hankel_Embedding_Performance(
         alpha=0.6,
     )
     if chosen_embedding_d is not None:
-        non_perturbed_axis.axhline(
+        match_count_axis.axhline(
             chosen_embedding_d,
             color="0.5",
             linestyle="--",
             linewidth=1.2,
-            zorder=1,
+            zorder=3,
         )
 
-    axes[0].set_ylabel(r"Hankel embedding dimension, $d$")
+    axes[0].set_ylabel(r"Hankel embedding"+"\n" + r"dimension, $d$")
     axes[0].set_yticks(hankel_d_values)
-    axes[0].set_ylim(np.max(hankel_d_values), 0)
+    axes[0].set_ylim(np.max(hankel_d_values), 1)
+    median_handle = Line2D(
+        [],
+        [],
+        color="0.25",
+        linewidth=1.5,
+        label="Solid line: median",
+    )
+    spread_handle = Patch(
+        facecolor="0.4",
+        edgecolor="none",
+        alpha=0.15,
+        label="Shaded area: p05–p95 spread",
+    )
+    fig.legend(
+        handles=[median_handle, spread_handle],
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.01),
+        ncol=2,
+        frameon=False,
+        handlelength=2.2,
+        columnspacing=1.8,
+    )
     fig.subplots_adjust(
-        left=0.10,
+        left=0.12,
         right=0.98,
-        top=0.92,
-        bottom=0.24,
+        top=0.96,
+        bottom=0.44,
         wspace=0.18,
     )
 
@@ -2921,15 +3134,15 @@ def Plot_Single_Run_Ensemble_Results(
     record_plotting_params,
     figure_width,
     non_perturbed_record="resolved",
-    period_windows=((3, 25), (25, 100)),
-    similarity_margin=0.05,
+    period_windows=((2, 25), (25, 100)),
 ):
     """Plot one non-perturbed run and its perturbation ensemble.
 
-    Each period window is a column containing a period-similarity panel above
-    a stacked histogram of the ensemble's matched and unmatched recovered
-    periods. Matched histogram entries retain their reference-mode colour;
-    unmatched recovered modes are grey.
+    Each period window is a column containing a threshold-relative spatial
+    quality panel above a stacked histogram of the ensemble's matched and
+    unmatched recovered periods. Matched histogram entries retain their
+    reference-mode colour; unmatched recovered modes are grey. Histogram
+    limits use the total number of attempted ensemble realisations.
 
     The ensemble summaries in ``results_dict["median"]`` are assumed to have
     been added with :func:`Ensemble_To_Median`. The percentile error bars are
@@ -2960,6 +3173,37 @@ def Plot_Single_Run_Ensemble_Results(
     ensemble_results = results_dict.get("ensemble", False)
     if not isinstance(ensemble_results, dict):
         raise ValueError("No ensemble results found in results_dict.")
+    n_ensemble = len(ensemble_results)
+    if n_ensemble == 0:
+        raise ValueError("No ensemble realisations found in results_dict.")
+
+    similarity_threshold = float(similarity_threshold)
+    if not np.isfinite(similarity_threshold):
+        raise ValueError("similarity_threshold must be finite.")
+    if not 0 <= similarity_threshold < 1:
+        raise ValueError(
+            "similarity_threshold must lie between zero (inclusive) and "
+            "one (exclusive)."
+        )
+
+    def threshold_relative_quality(similarity):
+        quality = (
+            (np.asarray(similarity, dtype=float) - similarity_threshold)
+            / (1 - similarity_threshold)
+        )
+        quality_tolerance = 1e-12
+        finite_quality = quality[np.isfinite(quality)]
+        if np.any(
+            (finite_quality < -quality_tolerance)
+            | (finite_quality > 1 + quality_tolerance)
+        ):
+            raise ValueError(
+                "Recovered-mode similarity is inconsistent with the "
+                "matching threshold used for threshold-relative spatial "
+                "quality."
+            )
+        quality = np.clip(quality, 0.0, 1.0)
+        return float(quality) if quality.ndim == 0 else quality
 
     mode_keys = sorted(
         syn_suite_info,
@@ -2985,17 +3229,8 @@ def Plot_Single_Run_Ensemble_Results(
     unmatched_periods = np.asarray(total_unmatched_periods, dtype=float)
     unmatched_periods = unmatched_periods[np.isfinite(unmatched_periods)].tolist()
 
-    similarity_limits = (
-        max(0.0, similarity_threshold - similarity_margin),
-        1.0,
-    )
-    if similarity_limits[0] >= similarity_limits[1]:
-        raise ValueError(
-            "similarity_threshold - similarity_margin must be below 1."
-        )
-
     # Preserve the compact panels while reserving enough vertical space for
-    # the two-row legend below the shared x labels.
+    # the single-row legend below the shared x labels.
     figure_height = 0.50 * figure_width
     fig, axes = plt.subplots(
         nrows=2,
@@ -3026,7 +3261,7 @@ def Plot_Single_Run_Ensemble_Results(
         histogram_ax = axes[1, column]
 
         similarity_ax.set_xlim(period_limits)
-        similarity_ax.set_ylim(similarity_limits)
+        similarity_ax.set_ylim(0, 1)
         similarity_ax.set_title(
             f"{period_limits[0]:g}–{period_limits[1]:g} year periods"
         )
@@ -3036,14 +3271,6 @@ def Plot_Single_Run_Ensemble_Results(
             linewidth=0.7,
             alpha=0.5,
         )
-        similarity_ax.axhline(
-            similarity_threshold,
-            color="black",
-            linestyle="--",
-            linewidth=1.2,
-            zorder=1,
-        )
-
         histogram_ax.hist(
             histogram_values,
             bins=100,
@@ -3054,6 +3281,7 @@ def Plot_Single_Run_Ensemble_Results(
             zorder=1,
         )
         histogram_ax.set_xlim(period_limits)
+        histogram_ax.set_ylim(0, n_ensemble)
         histogram_ax.set_xlabel(
             "Recovered period (years)",
             labelpad=3,
@@ -3083,9 +3311,12 @@ def Plot_Single_Run_Ensemble_Results(
 
             mode_result = non_perturbed_results.get(mode_key, False)
             if isinstance(mode_result, dict):
+                spatial_quality = threshold_relative_quality(
+                    mode_result["match_similarity"]
+                )
                 similarity_ax.plot(
                     mode_result["match_period"],
-                    mode_result["match_similarity"],
+                    spatial_quality,
                     color=mode_colour,
                     marker=non_perturbed_marker,
                     markersize=marker_size,
@@ -3105,7 +3336,14 @@ def Plot_Single_Run_Ensemble_Results(
             period_result = median_mode_result["match_periods"]
             similarity_result = median_mode_result["match_similarities"]
             period_median = period_result["value"]
-            similarity_median = similarity_result["value"]
+            similarity_summary = threshold_relative_quality(np.array([
+                similarity_result["p05"],
+                similarity_result["value"],
+                similarity_result["p95"],
+            ]))
+            similarity_low, similarity_median, similarity_high = (
+                similarity_summary
+            )
 
             if not (
                 np.isfinite(period_median)
@@ -3118,8 +3356,8 @@ def Plot_Single_Run_Ensemble_Results(
                 [period_result["p95"] - period_median],
             ])
             similarity_errorbars = np.array([
-                [similarity_median - similarity_result["p05"]],
-                [similarity_result["p95"] - similarity_median],
+                [similarity_median - similarity_low],
+                [similarity_high - similarity_median],
             ])
 
             similarity_ax.errorbar(
@@ -3140,18 +3378,11 @@ def Plot_Single_Run_Ensemble_Results(
                 zorder=3,
             )
 
-    axes[0, 0].set_ylabel("Recovered-mode\nsimilarity")
+    axes[0, 0].set_ylabel(
+        "Threshold-relative\nspatial quality, " r"$Q_S$"
+    )
     axes[1, 0].set_ylabel("Ensemble\nrecovery count")
 
-    record_labels = {
-        "ideal": "Ideal",
-        "resolved": "Resolved",
-        "background": "Background",
-    }
-    non_perturbed_label = record_labels.get(
-        non_perturbed_record,
-        non_perturbed_record.replace("_", " ").title(),
-    )
     legend_handles = [
         Line2D(
             [],
@@ -3161,7 +3392,7 @@ def Plot_Single_Run_Ensemble_Results(
             markerfacecolor="0.6",
             markeredgecolor="black",
             markersize=marker_size,
-            label=f"{non_perturbed_label} (no perturbation)",
+            label="No perturbation",
         ),
         Line2D(
             [],
@@ -3171,7 +3402,7 @@ def Plot_Single_Run_Ensemble_Results(
             markerfacecolor="0.6",
             markeredgecolor="black",
             markersize=marker_size,
-            label="Median (5–95%)",
+            label="Median",
         ),
         Line2D(
             [],
@@ -3179,29 +3410,21 @@ def Plot_Single_Run_Ensemble_Results(
             color="0.45",
             linestyle="--",
             linewidth=1.2,
-            label="Reference periods",
-        ),
-        Line2D(
-            [],
-            [],
-            color="black",
-            linestyle="--",
-            linewidth=1.2,
-            label=f"Threshold ({similarity_threshold:.3f})",
+            label="Reference period",
         ),
     ]
     fig.legend(
         handles=legend_handles,
         loc="lower center",
         bbox_to_anchor=(0.5, 0.01),
-        ncol=2,
+        ncol=3,
         frameon=False,
     )
     fig.subplots_adjust(
         left=0.10,
         right=0.98,
         top=0.94,
-        bottom=0.30,
+        bottom=0.22,
         wspace=0.12,
         hspace=0.08,
     )
@@ -3426,21 +3649,6 @@ def Single_Run_Ensemble_Results_Table(
             weight="bold",
         )
 
-    caption = (
-        f"Ensemble recovery uses {ensemble_denominator} "
-        f"{ensemble_percentage_basis} runs; "
-        f"{n_converged}/{n_attempted} converged."
-    )
-    ax.text(
-        0.0,
-        0.02,
-        caption,
-        transform=ax.transAxes,
-        ha="left",
-        va="bottom",
-        fontsize=font_size,
-        color="black",
-    )
 
     fig.subplots_adjust(left=0.0, right=1.0, top=1.0, bottom=0.0)
     return fig, table
@@ -4187,20 +4395,446 @@ def Build_Synthetic_Mode_Visualisation_Data(
     return visualisation_rows, syn_suite_info, recovered_mode_sets
 
 
+def Build_Recovery_Visualisation_Data(
+    mode_numbers,
+    nmax,
+    wave_only_setup,
+    background_only_setup,
+    waves_background_setup,
+    n_ensemble=100,
+    spurious_target_period=5.2,
+    feasible_period_limits=(3, 100),
+):
+    """Build the selected input, matched, and spurious snapshot entries.
+
+    The wave-only, exact spectral-infill background-only, and combined
+    records each run their own perturbation ensemble. Each setup must supply
+    a fractional SVD energy threshold; :func:`Pipeline_Run` then applies the
+    ceiling of that ensemble's median effective rank to its corresponding
+    unperturbed record.
+    """
+
+    mode_numbers = [str(mode_number) for mode_number in mode_numbers]
+    required_mode_numbers = {"62", "48", "1", "6", "13", "45"}
+    missing_mode_numbers = required_mode_numbers - set(mode_numbers)
+    if missing_mode_numbers:
+        raise ValueError(
+            "mode_numbers is missing required visualisation modes: "
+            f"{sorted(missing_mode_numbers)}"
+        )
+    if not 1 <= int(nmax) <= 15:
+        raise ValueError("nmax must be an integer between 1 and 15.")
+    nmax = int(nmax)
+    if (
+        isinstance(n_ensemble, bool)
+        or int(n_ensemble) != n_ensemble
+        or n_ensemble <= 0
+    ):
+        raise ValueError("n_ensemble must be a positive integer.")
+    n_ensemble = int(n_ensemble)
+
+    period_min, period_max = feasible_period_limits
+    if not period_min < period_max:
+        raise ValueError("feasible_period_limits must be increasing.")
+    if not np.isfinite(spurious_target_period):
+        raise ValueError("spurious_target_period must be finite.")
+
+    setups = {
+        "wave_only": wave_only_setup,
+        "background_only": background_only_setup,
+        "waves_background": waves_background_setup,
+    }
+    for setup_name, setup in setups.items():
+        if not isinstance(setup, dict):
+            raise TypeError(f"{setup_name}_setup must be a dictionary.")
+        missing_keys = {"svd_rank", "dmd_settings"} - set(setup)
+        if missing_keys:
+            raise KeyError(
+                f"{setup_name}_setup is missing keys: {missing_keys}"
+            )
+        svd_rank = setup["svd_rank"]
+        if not (
+            isinstance(svd_rank, (float, np.floating))
+            and 0 < svd_rank < 1
+        ):
+            raise ValueError(
+                f"{setup_name}_setup['svd_rank'] must be a fractional "
+                "SVD energy threshold between zero and one."
+            )
+
+    record_dict, syn_suite_info = Record_Dict_Construct(
+        mode_numbers=mode_numbers,
+        nmax=nmax,
+    )
+    background_only_record = (
+        np.asarray(record_dict["background"])
+        - np.asarray(record_dict["resolved"])
+    )
+
+    case_definitions = {
+        "wave_only": {
+            "record_key": "resolved",
+            "record": record_dict["resolved"],
+            "setup": wave_only_setup,
+        },
+        "background_only": {
+            "record_key": "background_only",
+            "record": background_only_record,
+            "setup": background_only_setup,
+        },
+        "waves_background": {
+            "record_key": "background",
+            "record": record_dict["background"],
+            "setup": waves_background_setup,
+        },
+    }
+
+    case_outputs = {}
+    for case_key, case_definition in case_definitions.items():
+        record_key = case_definition["record_key"]
+        setup = case_definition["setup"]
+        case_results, unmatched_periods, recovered_modes = Pipeline_Run(
+            {record_key: case_definition["record"]},
+            syn_suite_info,
+            dmd_settings=setup["dmd_settings"].copy(),
+            nmax=nmax,
+            svd_rank=setup["svd_rank"],
+            ensemble_settings={
+                "ensemble_flag": True,
+                "n_ensemble": n_ensemble,
+                "record_for_ensemble": record_key,
+            },
+            syn_record=True,
+            total_unmatched_period_return=True,
+        )
+        if not isinstance(recovered_modes, dict):
+            raise RuntimeError(
+                f"The adaptive-rank unperturbed {case_key} DMD run failed."
+            )
+        case_results = Ensemble_To_Median(
+            case_results,
+            syn_suite_info,
+        )
+        case_outputs[case_key] = {
+            "record_key": record_key,
+            "results": case_results,
+            "recovered_modes": recovered_modes,
+            "unmatched_ensemble_periods": unmatched_periods,
+        }
+
+    design_matrix = Truncate_Gauss_Coeffs(A_15_r, tmax=nmax)
+    reference_phasors = {
+        mode_key: (
+            design_matrix
+            @ Truncate_Gauss_Coeffs(
+                syn_suite_info[mode_key]["gnm_phasor"],
+                tmax=nmax,
+            ).T
+        )
+        for mode_key in mode_numbers
+    }
+
+    def input_entry(mode_key):
+        mode_info = syn_suite_info[mode_key]
+        return {
+            "phasor": np.asarray(
+                reference_phasors[mode_key],
+                dtype=complex,
+            ).ravel(),
+            "period": float(mode_info["true_period"]),
+            "label": f"Mode {mode_key}",
+            "mode_key": mode_key,
+            "recovered_index": None,
+        }
+
+    def matched_entry(case_key, mode_key):
+        case_output = case_outputs[case_key]
+        record_results = case_output["results"][
+            case_output["record_key"]
+        ]
+        entry = _Matched_Recovered_Mode_Entry(
+            mode_key,
+            record_results,
+            case_output["recovered_modes"],
+            reference_phasors[mode_key],
+        )
+        if entry is None:
+            raise RuntimeError(
+                f"The adaptive-rank {case_key} run did not recover "
+                f"Mode {mode_key}."
+            )
+        entry["label"] = f"Recovered (Mode {mode_key})"
+        entry["mode_key"] = mode_key
+        return entry
+
+    wave_only_matches = {
+        mode_key: matched_entry("wave_only", mode_key)
+        for mode_key in ("62", "48", "6")
+    }
+    waves_background_mode_45 = matched_entry(
+        "waves_background",
+        "45",
+    )
+
+    waves_background_output = case_outputs["waves_background"]
+    waves_background_results = waves_background_output["results"][
+        waves_background_output["record_key"]
+    ]
+    waves_background_modes = waves_background_output["recovered_modes"]
+    matched_output_indices = set()
+    for mode_key in mode_numbers:
+        matched_mode = _Matched_Recovered_Mode_Entry(
+            mode_key,
+            waves_background_results,
+            waves_background_modes,
+            reference_phasors[mode_key],
+        )
+        if matched_mode is not None:
+            matched_output_indices.add(matched_mode["recovered_index"])
+
+    recovered_periods = np.asarray(
+        waves_background_modes["periods"],
+        dtype=float,
+    )
+    feasible_unmatched_indices = np.asarray([
+        recovered_index
+        for recovered_index, recovered_period in enumerate(recovered_periods)
+        if (
+            recovered_index not in matched_output_indices
+            and np.isfinite(recovered_period)
+            and period_min < recovered_period < period_max
+        )
+    ], dtype=int)
+    if feasible_unmatched_indices.size == 0:
+        raise RuntimeError(
+            "The waves-with-background run has no unmatched feasible mode."
+        )
+
+    spurious_index = int(feasible_unmatched_indices[np.argmin(
+        np.abs(
+            recovered_periods[feasible_unmatched_indices]
+            - spurious_target_period
+        )
+    )])
+    spurious_entry = {
+        "phasor": np.asarray(
+            waves_background_modes["phasors"][spurious_index],
+            dtype=complex,
+        ).ravel(),
+        "eigenvalue": complex(
+            waves_background_modes["continuous_eigenvalues"][
+                spurious_index
+            ]
+        ),
+        "period": float(recovered_periods[spurious_index]),
+        "similarity": np.nan,
+        "recovered_index": spurious_index,
+        "label": "Spurious mode",
+        "mode_key": None,
+    }
+
+    snapshot_entries = {
+        "input_mode_62": {
+            **input_entry("62"),
+            "scale_group": "mode_62",
+        },
+        "wave_only_recovered_mode_62": {
+            **wave_only_matches["62"],
+            "scale_group": "mode_62",
+        },
+        "input_mode_48": {
+            **input_entry("48"),
+            "scale_group": "mode_48",
+        },
+        "wave_only_recovered_mode_48": {
+            **wave_only_matches["48"],
+            "scale_group": "mode_48",
+        },
+        "input_mode_1": {
+            **input_entry("1"),
+            "scale_group": "modes_1_6_13",
+        },
+        "input_mode_6": {
+            **input_entry("6"),
+            "scale_group": "modes_1_6_13",
+        },
+        "input_mode_13": {
+            **input_entry("13"),
+            "scale_group": "modes_1_6_13",
+        },
+        "wave_only_recovered_mode_6": {
+            **wave_only_matches["6"],
+            "scale_group": "modes_1_6_13",
+        },
+        "input_mode_45": {
+            **input_entry("45"),
+            "scale_group": "mode_45_and_spurious",
+        },
+        "waves_background_recovered_mode_45": {
+            **waves_background_mode_45,
+            "scale_group": "mode_45_and_spurious",
+        },
+        "waves_background_spurious_mode_5p2yr": {
+            **spurious_entry,
+            "scale_group": "mode_45_and_spurious",
+        },
+    }
+
+    return snapshot_entries, syn_suite_info, case_outputs
+
+
+def Save_Recovery_Visualisation_Snapshots(
+    snapshot_entries,
+    output_dir=None,
+    state_shape=state_shape,
+    longitude=longitude,
+    latitude=latitude,
+    figure_width=text_width / 4,
+    font_size=11,
+    cmap="seismic",
+    png_dpi=600,
+):
+    """Save individual real-phasor Mollweide snapshots with shared scales."""
+
+    if not snapshot_entries:
+        raise ValueError("snapshot_entries cannot be empty.")
+    if output_dir is None:
+        output_dir = RESULT_DIR / "recovery_visualisation"
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    longitude = np.asarray(longitude, dtype=float)
+    latitude = np.asarray(latitude, dtype=float)
+    if longitude.size != state_shape[1] or latitude.size != state_shape[0]:
+        raise ValueError(
+            "longitude and latitude lengths must agree with state_shape."
+        )
+
+    longitude_wrapped = ((longitude + 180.0) % 360.0) - 180.0
+    longitude_order = np.argsort(longitude_wrapped)
+    longitude_radians = np.deg2rad(longitude_wrapped[longitude_order])
+    latitude_radians = np.deg2rad(latitude)
+    longitude_grid, latitude_grid = np.meshgrid(
+        longitude_radians,
+        latitude_radians,
+    )
+
+    real_snapshots = {}
+    group_values = {}
+    expected_size = int(np.prod(state_shape))
+    for snapshot_key, entry in snapshot_entries.items():
+        phasor = np.asarray(entry["phasor"], dtype=complex).ravel()
+        if phasor.size != expected_size:
+            raise ValueError(
+                f"Snapshot '{snapshot_key}' has phasor length "
+                f"{phasor.size}; expected {expected_size}."
+            )
+        snapshot = np.real(phasor).reshape(state_shape)
+        snapshot = snapshot[:, longitude_order]
+        real_snapshots[snapshot_key] = snapshot
+        finite_values = snapshot[np.isfinite(snapshot)]
+        if finite_values.size == 0:
+            raise ValueError(
+                f"Snapshot '{snapshot_key}' has no finite real values."
+            )
+        group_values.setdefault(entry["scale_group"], []).append(
+            finite_values
+        )
+
+    group_limits = {}
+    for group_key, finite_arrays in group_values.items():
+        colour_limit = float(np.max(np.abs(np.concatenate(finite_arrays))))
+        if not np.isfinite(colour_limit) or colour_limit == 0:
+            colour_limit = 1.0
+        group_limits[group_key] = colour_limit
+
+    figures = {}
+    saved_paths = {}
+    figure_height = 0.72 * figure_width
+    for snapshot_key, entry in snapshot_entries.items():
+        figure = plt.figure(figsize=(figure_width, figure_height))
+        axis = figure.add_subplot(111, projection="mollweide")
+        colour_limit = group_limits[entry["scale_group"]]
+        axis.pcolormesh(
+            longitude_grid,
+            latitude_grid,
+            real_snapshots[snapshot_key],
+            shading="auto",
+            cmap=cmap,
+            vmin=-colour_limit,
+            vmax=colour_limit,
+            rasterized=True,
+        )
+        axis.grid(False)
+        axis.set_xticks([])
+        axis.set_yticks([])
+        axis.tick_params(
+            axis="both",
+            which="both",
+            labelbottom=False,
+            labelleft=False,
+            labelright=False,
+            labeltop=False,
+            length=0,
+        )
+        axis.set_title(
+            f"{entry['label']}\n"
+            rf"$T = {float(entry['period']):.1f}\,\mathrm{{yr}}$",
+            fontsize=font_size,
+            pad=3,
+        )
+        figure.subplots_adjust(
+            left=0.01,
+            right=0.99,
+            bottom=0.02,
+            top=0.72,
+        )
+
+        png_path = output_dir / f"{snapshot_key}.png"
+        pdf_path = output_dir / f"{snapshot_key}.pdf"
+        figure.savefig(
+            png_path,
+            dpi=png_dpi,
+            facecolor="white",
+        )
+        figure.savefig(
+            pdf_path,
+            dpi=png_dpi,
+            facecolor="white",
+        )
+        figures[snapshot_key] = figure
+        saved_paths[snapshot_key] = {
+            "png": png_path,
+            "pdf": pdf_path,
+        }
+
+    return figures, saved_paths, group_limits
+
+
 def Plot_Synthetic_Mode_Visualisation(
     visualisation_rows,
     state_shape=state_shape,
     longitude=longitude,
     latitude=latitude,
-    figure_width=14,
-    font_size=10,
+    figure_width=text_width,
+    font_size=11,
     cmap="seismic",
     sort_by_period=True,
+    mode_colours=None,
+    row_height=1.78,
 ):
-    """Plot phase-aligned real phasors across four record contexts."""
+    """Plot phase-aligned real phasors across four record contexts.
+
+    Each mode occupies one compact row with a shared horizontal colour bar.
+    Snapshot titles report period and input-mode similarity.
+    """
 
     if not visualisation_rows:
         raise ValueError("visualisation_rows cannot be empty.")
+    if font_size < 11:
+        raise ValueError("font_size must be at least 11 for thesis figures.")
+    if figure_width <= 0 or row_height <= 0:
+        raise ValueError("figure_width and row_height must be positive.")
 
     column_keys = (
         "ideal",
@@ -4210,11 +4844,23 @@ def Plot_Synthetic_Mode_Visualisation(
     )
     column_labels = (
         "Ideal input",
-        "Resolved ensemble\nmedian-similarity member",
-        "Resolved + background ensemble\nmedian-similarity member",
-        "Background-only closest period",
+        "Resolved ensemble",
+        "Resolved + background\nensemble",
+        "Background only\n(closest period)",
     )
     mode_keys = list(visualisation_rows.keys())
+    if mode_colours is None:
+        mode_colours = {
+            mode_key: tol_muted[mode_index % len(tol_muted)]
+            for mode_index, mode_key in enumerate(mode_keys)
+        }
+    else:
+        missing_colours = set(mode_keys) - set(mode_colours)
+        if missing_colours:
+            raise KeyError(
+                "Missing display colours for modes: "
+                f"{sorted(missing_colours)}"
+            )
     if sort_by_period:
         mode_keys = sorted(
             mode_keys,
@@ -4237,31 +4883,81 @@ def Plot_Synthetic_Mode_Visualisation(
         latitude_radians,
     )
 
+    def compact_colourbar_value(value):
+        value = float(value)
+        if np.isclose(value, 0.0):
+            return "0"
+        exponent = int(np.floor(np.log10(abs(value))))
+        if abs(exponent) >= 3:
+            mantissa = value / (10.0 ** exponent)
+            return rf"${mantissa:.2g}\times10^{{{exponent}}}$"
+        return f"{value:.3g}"
+
+    def compact_metric_value(value, format_spec):
+        value = float(value)
+        if np.isnan(value):
+            return "—"
+        if np.isposinf(value):
+            return "∞"
+        if np.isneginf(value):
+            return "−∞"
+        return format(value, format_spec)
+
     n_rows = len(mode_keys)
-    fig, axes = plt.subplots(
-        nrows=n_rows,
-        ncols=4,
-        figsize=(figure_width, max(2.35 * n_rows, 3.5)),
-        squeeze=False,
-        subplot_kw={"projection": "mollweide"},
-        constrained_layout=True,
+    figure_height = max(row_height * n_rows + 0.48, 3.5)
+    fig = plt.figure(
+        figsize=(figure_width, figure_height),
     )
+    grid = fig.add_gridspec(
+        1 + 3 * n_rows,
+        4,
+        height_ratios=[0.25] + [0.30, 1.0, 0.27] * n_rows,
+        hspace=0.08,
+        wspace=0.06,
+    )
+    fig.subplots_adjust(
+        left=0.015,
+        right=0.985,
+        top=0.985,
+        bottom=0.015,
+    )
+    axes = np.empty((n_rows, 4), dtype=object)
 
     for column_index, column_label in enumerate(column_labels):
-        axes[0, column_index].text(
+        heading_axis = fig.add_subplot(grid[0, column_index])
+        heading_axis.axis("off")
+        heading_axis.text(
             0.5,
-            1.46,
+            0.0,
             column_label,
-            transform=axes[0, column_index].transAxes,
+            transform=heading_axis.transAxes,
             ha="center",
             va="bottom",
-            fontsize=font_size + 1,
+            fontsize=font_size,
             fontweight="bold",
         )
 
     for row_index, mode_key in enumerate(mode_keys):
         row_results = visualisation_rows[mode_key]
-        reference_period = float(row_results["reference_period"])
+        mode_heading_row = 1 + 3 * row_index
+        snapshot_row = mode_heading_row + 1
+        colourbar_row = mode_heading_row + 2
+
+        mode_heading_axis = fig.add_subplot(
+            grid[mode_heading_row, :]
+        )
+        mode_heading_axis.axis("off")
+        mode_heading_axis.text(
+            0.5,
+            0.95,
+            f"Mode {mode_key}",
+            transform=mode_heading_axis.transAxes,
+            ha="center",
+            va="top",
+            fontsize=font_size,
+            fontweight="bold",
+            color=mode_colours[mode_key],
+        )
 
         first_three_snapshots = []
         for column_key in column_keys[:3]:
@@ -4286,7 +4982,11 @@ def Plot_Synthetic_Mode_Visualisation(
         row_mesh = None
         null_exceeds_scale = False
         for column_index, column_key in enumerate(column_keys):
-            axis = axes[row_index, column_index]
+            axis = fig.add_subplot(
+                grid[snapshot_row, column_index],
+                projection="mollweide",
+            )
+            axes[row_index, column_index] = axis
             entry = row_results.get(column_key)
 
             axis.grid(
@@ -4295,7 +4995,15 @@ def Plot_Synthetic_Mode_Visualisation(
                 linewidth=0.6,
                 alpha=0.5,
             )
-            axis.tick_params(labelsize=font_size - 2)
+            axis.tick_params(
+                axis="both",
+                which="both",
+                labelbottom=False,
+                labelleft=False,
+                labelright=False,
+                labeltop=False,
+                length=0,
+            )
 
             if entry is None:
                 axis.text(
@@ -4305,14 +5013,14 @@ def Plot_Synthetic_Mode_Visualisation(
                     transform=axis.transAxes,
                     ha="center",
                     va="center",
-                    fontsize=font_size + 1,
+                    fontsize=font_size,
                     fontweight="bold",
                     color="0.35",
                 )
                 axis.set_title(
-                    "No recovered mode",
+                    "T=— yr | S=—",
                     fontsize=font_size,
-                    pad=9,
+                    pad=4,
                 )
                 continue
 
@@ -4341,44 +5049,51 @@ def Plot_Synthetic_Mode_Visualisation(
                 rasterized=True,
             )
 
-            eigenvalue = complex(entry["eigenvalue"])
+            period = float(entry["period"])
             similarity = float(entry["similarity"])
-            sign = "+" if eigenvalue.imag >= 0 else "-"
+            period_text = compact_metric_value(period, ".1f")
+            similarity_text = compact_metric_value(similarity, ".2g")
             axis.set_title(
-                (
-                    rf"$\lambda={eigenvalue.real:.3f}{sign}"
-                    rf"{abs(eigenvalue.imag):.3f}i$ yr$^{{-1}}$"
-                    "\n"
-                    rf"$S={similarity:.3f}$"
-                ),
+                f"T={period_text} yr | S={similarity_text}",
                 fontsize=font_size,
-                pad=9,
+                pad=4,
             )
 
-        axes[row_index, 0].text(
-            -0.20,
-            0.5,
-            f"Mode {mode_key}\n{reference_period:.2f} yr",
-            transform=axes[row_index, 0].transAxes,
-            ha="right",
-            va="center",
-            fontsize=font_size + 1,
-            fontweight="bold",
+        colourbar_host = fig.add_subplot(grid[colourbar_row, :])
+        colourbar_host.axis("off")
+        colourbar_axis = colourbar_host.inset_axes(
+            [0.15, 0.64, 0.70, 0.16]
         )
-
         colourbar = fig.colorbar(
             row_mesh,
-            ax=axes[row_index, :],
-            location="right",
-            shrink=0.78,
-            pad=0.02,
+            cax=colourbar_axis,
+            orientation="horizontal",
             extend="both" if null_exceeds_scale else "neither",
         )
-        colourbar.set_label(
-            "SV amplitude",
+        colourbar.set_ticks([])
+        colourbar_axis.set_xlabel(
+            r"SV amplitude (nT yr$^{-1}$)",
+            fontsize=font_size,
+            labelpad=2,
+        )
+        colourbar_host.text(
+            0.14,
+            0.72,
+            compact_colourbar_value(-colour_limit),
+            transform=colourbar_host.transAxes,
+            ha="right",
+            va="center",
             fontsize=font_size,
         )
-        colourbar.ax.tick_params(labelsize=font_size - 1)
+        colourbar_host.text(
+            0.86,
+            0.72,
+            compact_colourbar_value(colour_limit),
+            transform=colourbar_host.transAxes,
+            ha="left",
+            va="center",
+            fontsize=font_size,
+        )
 
     return fig, axes
 
